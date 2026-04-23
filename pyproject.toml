@@ -13,6 +13,7 @@ dependencies = [
     "psycopg[binary]",
     "httpx",
     "tenacity",
+    "google-genai",
 ]
 
 [build-system]
