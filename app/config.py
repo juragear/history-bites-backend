@@ -9,5 +9,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str
 
+    WIKIPEDIA_USER_AGENT: str
+
 
 settings = Settings()
