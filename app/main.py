@@ -2,9 +2,12 @@ import json
 import logging
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
+from app.db import engine
 
 
 class JSONFormatter(logging.Formatter):
@@ -42,5 +45,12 @@ def on_startup() -> None:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health(response: Response) -> dict[str, str]:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        logger.warning("health db probe failed", extra={"extra": {"error": str(exc)}})
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "degraded", "db": "down"}
+    return {"status": "ok", "db": "ok"}

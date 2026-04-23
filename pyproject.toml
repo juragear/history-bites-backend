@@ -10,6 +10,7 @@ dependencies = [
     "pydantic-settings",
     "sqlalchemy",
     "alembic",
+    "psycopg[binary]",
     "httpx",
     "tenacity",
 ]

@@ -7,5 +7,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
 
+    DATABASE_URL: str
+
 
 settings = Settings()
