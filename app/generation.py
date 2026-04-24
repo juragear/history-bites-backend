@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import date, timedelta
 
 import httpx
 from sqlalchemy import select, union_all
@@ -43,6 +44,10 @@ MAX_CANDIDATE_ATTEMPTS = 3
 
 class GenerationFailed(Exception):
     """Raised when every attempted candidate failed. Caller decides what to do."""
+
+
+class NoApprovedPool(Exception):
+    """Raised when schedule_tomorrows_fact finds zero approved pool rows (D21b)."""
 
 
 def is_valid(fact: str) -> bool:
@@ -248,3 +253,151 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
     raise GenerationFailed(
         f"{category}: {attempts} attempts exhausted. Failures: {failures}"
     )
+
+
+def is_already_scheduled(session: Session, target_date: date) -> bool:
+    """Idempotency guard for schedule_tomorrows_fact — avoids double-scheduling."""
+    return (
+        session.execute(
+            select(Fact.id).where(Fact.scheduled_date == target_date)
+        ).first()
+        is not None
+    )
+
+
+def recent_facts(session: Session, n: int = 3) -> list[Fact]:
+    """The last N scheduled facts, newest first. May return fewer than N (D21b)."""
+    return list(
+        session.execute(
+            select(Fact).order_by(Fact.scheduled_date.desc()).limit(n)
+        ).scalars()
+    )
+
+
+def schedule_tomorrows_fact(
+    session: Session, target_date: date | None = None
+) -> Fact | None:
+    """Promote one approved pool row to tomorrow's scheduled Fact (D21a/b).
+
+    - target_date defaults to date.today() + 1 (server runs UTC per D15).
+    - If that date is already scheduled, log and return None (idempotent).
+    - Selects approved pool rows with FOR UPDATE SKIP LOCKED (D21a) so a
+      concurrent scheduler can't grab the same row.
+    - Variety picker (D21b): prefer an approved row whose region AND era are
+      both absent from the last 3 scheduled facts; fall back to oldest
+      approved if no such row exists. When there's 0-3 recent history, the
+      filter naturally degrades — empty history -> everything is "preferred".
+    - One transaction: insert Fact + delete PoolFact. IntegrityError (unique
+      collision — a peer scheduled the same date in parallel) rolls back and
+      returns None so the caller can no-op the cron run.
+    """
+    if target_date is None:
+        target_date = date.today() + timedelta(days=1)
+
+    if is_already_scheduled(session, target_date):
+        logger.info(
+            "already scheduled, idempotent no-op",
+            extra={"extra": {"scheduled_date": target_date.isoformat()}},
+        )
+        return None
+
+    recent = recent_facts(session, 3)
+    recent_regions = {f.region for f in recent if f.region is not None}
+    recent_eras = {f.era for f in recent if f.era is not None}
+
+    approved_stmt = (
+        select(PoolFact)
+        .where(PoolFact.status == "approved")
+        .order_by(PoolFact.created_at.asc())
+        .with_for_update(skip_locked=True)
+    )
+    approved = list(session.execute(approved_stmt).scalars())
+
+    if not approved:
+        logger.warning(
+            "no approved pool rows available",
+            extra={"extra": {"scheduled_date": target_date.isoformat()}},
+        )
+        raise NoApprovedPool(
+            f"no approved pool rows available for {target_date.isoformat()}"
+        )
+
+    if recent:
+        preferred = [
+            p
+            for p in approved
+            if p.region not in recent_regions and p.era not in recent_eras
+        ]
+        if preferred:
+            pick = preferred[0]
+            variety = "preferred"
+        else:
+            pick = approved[0]
+            variety = "fallback"
+    else:
+        pick = approved[0]
+        variety = "empty-history"
+
+    logger.info(
+        "picked approved pool row",
+        extra={
+            "extra": {
+                "pool_id": pick.id,
+                "variety": variety,
+                "region": pick.region,
+                "era": pick.era,
+                "recent_regions": sorted(recent_regions),
+                "recent_eras": sorted(recent_eras),
+                "approved_total": len(approved),
+            }
+        },
+    )
+
+    fact = Fact(
+        scheduled_date=target_date,
+        fact_text=pick.fact_text,
+        source_name=pick.source_name,
+        source_url=pick.source_url,
+        source_license=pick.source_license,
+        external_id=pick.external_id,
+        language=pick.language,
+        category=pick.category,
+        region=pick.region,
+        era=pick.era,
+        model_used=pick.model_used,
+        prompt_version=pick.prompt_version,
+    )
+    session.add(fact)
+    session.delete(pick)
+    try:
+        session.flush()
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        logger.warning(
+            "integrity error on schedule (lost race)",
+            extra={
+                "extra": {
+                    "scheduled_date": target_date.isoformat(),
+                    "pool_id": pick.id,
+                    "error": str(exc.orig) if exc.orig else str(exc),
+                }
+            },
+        )
+        return None
+
+    logger.info(
+        "scheduled fact",
+        extra={
+            "extra": {
+                "fact_id": fact.id,
+                "scheduled_date": target_date.isoformat(),
+                "pool_id_consumed": pick.id,
+                "external_id": fact.external_id,
+                "region": fact.region,
+                "era": fact.era,
+                "variety": variety,
+            }
+        },
+    )
+    return fact
