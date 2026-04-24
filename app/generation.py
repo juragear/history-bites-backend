@@ -386,6 +386,13 @@ def schedule_tomorrows_fact(
         )
         return None
 
+    # D21c: bust any cached /today entry that would have returned stale data
+    # for this date. Import locally to avoid a circular import (main imports
+    # generation for admin endpoints in Step 8).
+    from app.main import invalidate_today_cache
+
+    invalidate_today_cache(target_date)
+
     logger.info(
         "scheduled fact",
         extra={
