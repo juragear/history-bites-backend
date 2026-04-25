@@ -1,0 +1,360 @@
+# HistoryBites — Decisions Log
+
+This file mirrors the canonical Decisions Log in Notion:
+https://www.notion.so/34a52c14aa53815a9b3ce27168f9b8f7
+
+The Notion version is the source of truth. This mirror exists so contributors
+can grep/diff decisions without leaving the editor. Update both when adding
+new decisions.
+
+Append-only record of architectural decisions and their reasoning. The point
+of this page is so Claude Code (and future Will) understands **why** things
+are the way they are, and doesn't waste time re-litigating settled questions.
+
+Format: one decision per section. What we chose, why, what we rejected.
+
+---
+
+## D1 — Wikipedia is the primary source for v1
+
+**Decision:** Build only the Wikipedia adapter for v1. Other sources are post-launch.
+
+**Why:** Wikipedia's CC BY-SA 4.0 license is unambiguous, the API is best-in-class, and non-English editions solve the cultural diversity problem on their own in Phase 5. Adding multiple sources on day one is premature abstraction.
+
+**Rejected:** Starting with a multi-source pipeline. Building a `Source` protocol with no second implementation.
+
+---
+
+## D2 — Pick the article first, summarise second
+
+**Decision:** The pipeline always selects a specific Wikipedia article first, then feeds its extract to Gemini and asks for a surprising fact. Gemini never freelances or "searches."
+
+**Why:** Guarantees a real, verifiable source URL. Eliminates hallucinated history. Makes copyright compliance tractable (we know exactly what Gemini saw).
+
+**Rejected:** "Ask Gemini for a surprising history fact" with no source grounding.
+
+---
+
+## D3 — Uniqueness enforced at topic level, not semantic
+
+**Decision:** Store `wikipedia_page_id` (as `external_id`) with a UNIQUE constraint per source. Never reuse the same article. Semantic variety is handled separately by category/era/region sampling.
+
+**Why:** Semantic uniqueness ("don't run 3 battles in a row") is a vector-similarity problem that's overkill for this use case. Topic-level uniqueness via a unique index is one line of schema and covers the actual failure mode.
+
+**Rejected:** Embedding every fact and doing cosine similarity against history.
+
+---
+
+## D4 — Cultural diversity is a sampling problem
+
+**Decision:** Curate a list of ~30-50 `(wikipedia_category, region, era)` tuples. Pick uniformly at random. To increase weight on underrepresented areas, add more tuples covering them.
+
+**Why:** English Wikipedia's random endpoint skews US/UK/sports because that's where the editor gravity is. Curated categories give direct control. No explicit weights — tuple count is the weight.
+
+**Rejected:** Wikipedia random endpoint with post-hoc filtering. Explicit numeric weights (easier to tune by adding/removing tuples).
+
+---
+
+## D5 — Copyright compliance: facts vs. expression
+
+> **Superseded in part by D20 —** the n-gram validation step described below has been removed. The prompt instruction and human review gate remain.
+
+**Decision:** The v1 Gemini prompt explicitly instructs "Do not copy phrasing from the source. State the fact in your own words in one sentence." A validation step rejects any output containing an 8-word consecutive substring from the source extract.
+
+**Why:** Copyright protects expression, not facts. Close paraphrasing is infringement even with attribution. The n-gram check is cheap and catches the failure mode.
+
+**Rejected:** Relying on attribution alone. Trusting Gemini to paraphrase without a validation gate.
+
+---
+
+## D6 — Two tables (facts, pool), not one
+
+**Decision:** Separate `facts` and `pool` tables with near-identical schemas.
+
+**Why:** A single table with a nullable `scheduled_date` means every query has to remember whether it wants pool rows, delivered rows, or both. Forget once and you get bugs. Two tables have unambiguous semantics.
+
+**Trade-off:** Schema changes require touching both tables. Cross-table uniqueness (same article in both) enforced in application code, not DB.
+
+**Rejected:** Unified table with lifecycle column. "Clever" but accident-prone.
+
+---
+
+## D7 — Generate ahead, don't generate just-in-time
+
+**Decision:** Maintain a pool of pre-generated facts. Scheduling pops from the pool into `facts` for tomorrow. Delivery is a boring DB read.
+
+**Why:** Decouples generation from delivery. A Gemini outage at 9am doesn't miss a day — tomorrow's fact was already generated hours or days ago.
+
+**Rejected:** Generating today's fact in the request handler. Generating at 9am and delivering immediately.
+
+---
+
+## D8 — 7-day buffer, every 6h cron
+
+**Decision:** Target 7 approved pool items. Run the cron every 6h.
+
+**Why (buffer depth):** 7 days recovers cleanly from any realistic outage. Longer buffers lock in prompt/category mistakes for longer and mask generation failures. Shorter feedback loop is better for a solo dev iterating.
+
+**Why (cron frequency):** Idempotent jobs are cheap. 6h means max 6h to detect + recover from a broken run. Daily would be simpler but creates a 24h blind spot.
+
+**Rejected:** 30-day buffer (too slow to iterate). Hourly cron (unnecessary).
+
+---
+
+## D9 — Human review queue
+
+> **Modified by D23 —** human review now applies to BORDERLINE judge verdicts only. HIGH-confidence facts auto-approve, LOW-confidence auto-reject. The review UI built in Step 8 functions as designed; it just receives fewer items.
+
+**Decision:** Generated facts go into `pool` with `status='pending_review'`. Will reviews weekly via `/admin/review` HTML page. Only `approved` items can be scheduled into `facts`.
+
+**Why:** Quality control for v1. Even with a good prompt, Gemini will occasionally produce bland or weird output. A human gate catches this before users see it.
+
+**Rejected:** Programmatic validation only. Sync pool to Notion for review there (more moving parts, more to break).
+
+---
+
+## D10 — Wikipedia categorymembers, not search or SPARQL
+
+**Decision:** Use Wikipedia's `categorymembers` endpoint to list candidate articles.
+
+**Why:** Precise and controllable. Curated category seeds map directly. Keyword search is fuzzy. Wikidata SPARQL is powerful but significantly more complex and is a Phase 5 enhancement.
+
+**Rejected:** Wikipedia search endpoint (too fuzzy). Wikidata SPARQL (premature).
+
+---
+
+## D11 — stdlib logging, not a custom singleton
+
+**Decision:** Configure Python's `logging` module once at startup. Each module: `logger = logging.getLogger(__name__)`.
+
+**Why:** Python's `logging` module is already a singleton by design. Writing a `LogManager` class is un-Pythonic, considered a code smell, and reinvents stdlib. Modules themselves are singletons in Python.
+
+**Rejected:** Custom logging singleton class.
+
+---
+
+## D12 — Firebase Analytics client-side, not custom server endpoint
+
+**Decision:** Use Firebase Analytics on the Android side. No server-side analytics endpoint.
+
+**Why:** Industry standard. Free. DAU/session/custom events work out of the box. Building a server-side `/event` endpoint is reinventing the wheel and adds load.
+
+**Rejected:** Custom analytics pipeline.
+
+---
+
+## D13 — In-memory cache on /today, Cloudflare at public launch
+
+**Decision:** Cache `/today` responses in-memory for 5 minutes. Add Cloudflare in front of Railway at public launch.
+
+**Why:** Everyone gets the same fact — one DB query per 5-min window regardless of user count. Cloudflare is the actual viral-scale defence. Both are cheap insurance.
+
+**Rejected:** Redis cache (overkill for a single-instance app). Scaling Railway vertically as first response.
+
+---
+
+## D14 — No source abstraction until source #2
+
+**Decision:** `wikipedia.py` is concrete, not behind an interface. Create the abstraction only when adding Wikidata or Smithsonian.
+
+**Why:** Premature abstraction is worse than no abstraction. One implementation behind an interface gives no benefit. When source #2 exists, the interface falls out naturally from the diff.
+
+**Rejected:** Building `Source` protocol with just Wikipedia on day one.
+
+---
+
+## D15 — Timezone handling deferred
+
+**Decision:** Server runs UTC. `scheduled_date` is naive date, interpreted as AWST by both server and app. "Today" rolls over whenever the server thinks it does.
+
+**Why:** Single-region app for v1. International timezone handling is a Phase 5+ problem when we know if anyone cares.
+
+**Rejected:** Per-user timezone support, multi-region delivery windows.
+
+---
+
+## D16 — Model abstraction from day one, Gemini for production
+
+**Decision:** Define a `ModelProvider` Protocol with two implementations: `GeminiProvider` (used in production) and `OllamaProvider` (used locally for development against Gemma 4 on Apple Silicon). Production runs Gemini.
+
+**Why:** At our volume (~5 generations/day), Gemini 2.5 Flash costs ~$0.36/year. Self-hosting Gemma 31B in production would cost ~$1,750/year on cloud GPU — 5,000× more expensive than the API for the same workload. But Gemma 4's Apache 2.0 license is genuinely appealing as future insurance. The abstraction gets us both: API simplicity in production, plus the ability to swap to hosted-Gemma or self-hosted-anything as a one-day refactor if Gemini ever becomes problematic. Local Ollama provider also lets us iterate prompts during development without burning API quota.
+
+**Rejected:** Self-hosting Gemma 31B in production (5000× more expensive than the API for our volume; massive operational complexity). Direct Gemini SDK calls scattered across the codebase (lock-in for no benefit).
+
+---
+
+## D17 — FCM topic-based push for daily delivery
+
+**Decision:** Notification delivery uses Firebase Cloud Messaging (FCM) topics. The Android app subscribes to a single `daily-fact` topic on first launch; the server pushes one message to the topic at 08:00 AWST daily; FCM fans out to all subscribers. WorkManager-based scheduled notifications are removed.
+
+**Why:** WorkManager-based scheduled notifications are unreliable across non-Pixel Android devices — Samsung, Xiaomi, Oppo, Huawei, Vivo all aggressively kill background work via custom battery optimization. ~30-50% of installs would have unreliable delivery, which kills the product (the whole pitch is "morning notification"). FCM high-priority messages bypass Doze on virtually all OEMs because Google's messaging service is too important to break. Topics specifically (vs per-device tokens) eliminate the need for a devices table, registration endpoint, and token management — we have no per-user targeting need since everyone gets the same fact at the same time. FCM is free with no usage limits on the Spark tier.
+
+**Trade-off:** Drops user-selectable notification time. Everyone gets the fact at 08:00 AWST. Strengthens the "shared moment" product story (D7) at the cost of one piece of customization. Timezone bucketing is a clean upgrade later — same architecture, just multiple topics like `daily-fact-utc-plus-8`.
+
+**Rejected:** WorkManager-based scheduling (the actual root cause being solved). Per-user FCM tokens with per-user scheduling (premature complexity, requires timezone handling we deferred in D15). Hybrid FCM-wakes-WorkManager (doesn't actually solve the underlying battery-optimization issue).
+
+---
+
+## D18 — Retract endpoint and is_retracted column
+
+**Decision:** Add `is_retracted BOOLEAN NOT NULL DEFAULT FALSE` to the `facts` table. Add `POST /admin/retract/{date}` endpoint (bearer auth) that sets `is_retracted = TRUE`. The `/today` endpoint excludes retracted facts when looking up today's row and when falling back to latest available.
+
+**Why:** A product whose pitch is "a fact you can trust every morning" cannot ship without a way to take down a fact that turns out to be wrong, offensive, or a Gemini hallucination. Without this endpoint, fixing requires hand-rolling SQL against production, which is fragile and risks worse mistakes during an incident.
+
+**Rejected:** Hard-deleting the row (loses the audit trail of what was published; breaks the `UNIQUE (scheduled_date)` constraint if we ever needed to publish a replacement). Manual SQL only (operational risk during an actual incident).
+
+---
+
+## D19 — Mirror Decisions Log to backend repo as DECISIONS.md
+
+**Decision:** Maintain `DECISIONS.md` in the backend repo as a copy of this Notion page. Update both when decisions change.
+
+**Why:** Notion is the authoritative human-readable home for architectural rationale (cross-linking, formatting, easy editing). But Notion-only creates a bus factor: if the workspace is corrupted, access lost, or Notion goes down during a 2am debugging session, the rationale is gone. The repo copy is also what Claude Code can read directly without leaving the codebase context. Cheap insurance.
+
+**Rejected:** Notion-only (single point of failure). Repo-only (Notion is better for human reading + collaboration).
+
+---
+
+## D20 — Drop n-gram copyright validation (supersedes part of D5)
+
+**Decision:** Remove the 8-word n-gram substring check from the generation pipeline. Copyright safety in v1 relies on two layers: (a) the prompt explicitly instructing Gemini to restate in its own words, (b) human review (D9) gating publication.
+
+**Why:** The n-gram check catches verbatim copying but creates false confidence. Trivial paraphrases ("The king died in 1453" → "In 1453, the king died") bypass an 8-word consecutive-substring check while remaining borderline derivative. If we ever needed to defend our copyright posture, "we have a regex" reads worse than "we have an explicit prompt instruction and a human reviewer." The prompt and review layers are real protection; the n-gram check is theatre that takes engineering time to build, test, and maintain. Removing it eliminates a failure mode where a borderline output passes the check and gets shipped because the check "approved" it.
+
+**Rejected:** Keeping n-gram as defense in depth (false confidence has negative value when it influences review behavior). Building real semantic similarity (overkill for v1; revisit when there's evidence the prompt + review layers fail).
+
+---
+
+## D21 — Design hardening from system-design review
+
+**Decision:** Four concrete changes surfaced by a formal system-design pass before implementation. Bundled together because they're closely related edge-case hardening rather than architectural shifts.
+
+### D21a: Pool pick uses SELECT ... FOR UPDATE SKIP LOCKED
+
+When picking a pool row (either for scheduling or for manual operations), wrap the query with `FOR UPDATE SKIP LOCKED`. Prevents two concurrent processes (e.g. the 6h cron firing while `/admin/generate` is running) from racing to claim the same row.
+
+Example:
+
+```sql
+SELECT * FROM pool
+WHERE status = 'approved'
+ORDER BY ...
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+```
+
+Standard Postgres pattern. Zero operational overhead. Prevents a failure mode that's rare but ugly when it hits.
+
+### D21b: Variety picker handles empty/short history
+
+The variety logic ("avoid regions/eras from the last 3 delivered facts") must gracefully handle days 1-3 when `facts` has fewer than 3 rows. The filter becomes a preference, not a requirement. If applying the filter leaves zero candidates, fall back to oldest approved row.
+
+Concretely: `recent = facts.query().order_by(scheduled_date.desc()).limit(3).all()` — `recent` may be empty or have 1-2 entries; the picker must handle all cases, not just the happy path of 3+.
+
+Launch day is the worst possible moment for a silent crash here.
+
+### D21c: /today cache key includes the date
+
+The in-memory cache key must be today's ISO date, not a constant `"today"`. This ensures the cache auto-invalidates at midnight — no stale window where users get yesterday's fact just after the date rolls over.
+
+Additionally, any write to `facts` (retract, admin schedule) should bust the cache entry for the affected date. Small helper: `cache.pop(date, None)` after any mutation.
+
+### D21d: Retract is "no new views," not "recall"
+
+**Important semantic clarification:** `POST /admin/retract/{date}` prevents future reads via `/today` and `/archive`. It does NOT recall facts already pushed to devices. Users who received the FCM notification still have the fact in Room and will still see it in their local archive.
+
+This is a deliberate limitation, not a bug. True recall would require:
+- Server-side registry of which devices received which facts (we explicitly don't maintain this — D17 chose topics over tokens)
+- A "recall" FCM push that Android interprets as a delete instruction
+- Handling users who were offline when the original push landed but come online after recall
+
+None of that is built. For v1, retract is best-effort cleanup of a mistake going forward. If recall ever matters (legal takedown, something genuinely offensive slipped through review), the only options are (a) push a follow-up notification acknowledging the error or (b) ship an app update that filters the specific fact client-side. Both are manual processes, not architectural features.
+
+**Why bundled:** All four are small, hardening-focused, and discovered in the same review pass. Separate decisions would fragment the rationale. Any one of them alone isn't architecturally significant enough to warrant its own entry.
+
+**Rejected:** Building a full recall system (massive complexity for an unproven need). Semantic uniqueness checks beyond date-based cache keys (overkill). Distributed locking via Redis or similar (`FOR UPDATE SKIP LOCKED` is the Postgres-native answer; adding Redis violates our "stay simple" principle).
+
+---
+
+## D22 — Flutter as unified mobile codebase, iOS as Phase 2.5
+
+**Decision:** Phase 2 is rewritten as a Flutter (Dart) codebase targeting both Android and iOS from a single source. The existing Android Kotlin/Jetpack Compose prototype becomes archived reference material — patterns reused, code rewritten. iOS launches as a Phase 2.5 milestone after Android ships, sharing the same Flutter codebase.
+
+**Why:** Will's parents are iOS users and asked for the app. Two native codebases is unsustainable for a solo dev with Claude Code as multiplier — every feature change ports twice, every bug diagnosed twice, OEM quirks doubled. Flutter genuinely fits this app's requirements (typography- and spacing-driven UI, no complex animations, one feed screen + one settings screen). FCM topic-based push (D17) already made the backend iOS-ready by accident — no backend changes needed for iOS support beyond a small payload tweak in Step 9. The original Android prototype was already ≈70% slated for deletion in Phase 2 (Gemini path removal, entity refactor, WorkManager replacement), so the rewrite cost is similar to the planned refactor.
+
+**Why iOS as Phase 2.5 (not now, not as Phase 2):** Android approval is more forgiving and gives launch experience before tackling Apple's stricter review process. iOS submission benefits from lessons learned. Apple Developer account ($99/yr) deferred until iOS work actually starts.
+
+**Rejected:** Native iOS as a second codebase (the exact problem we're avoiding). React Native (community fragmentation, less polish than Flutter for this UI scope). PWA (iOS PWA push notifications are second-class, breaks the entire product premise). Staying Android-only (loses parents' actual user base, signals lack of commitment).
+
+---
+
+## D23 — LLM-as-judge with calibration set, modifies D9
+
+**Decision:** Replace pure-human review with a judge-triaged auto-approval system. Each generated fact is scored by a separate LLM call (the "judge") that auto-approves HIGH-quality facts, auto-rejects LOW-quality facts, and routes BORDERLINE facts to the existing human review UI. The judge is calibrated against a manually-rated training set of 150-200 facts using few-shot prompting + agreement metric.
+
+**Why:** D9's pure-human review has a real bus-factor problem — if Will is unavailable for >7 days the approved pool drains and the app silently dies. But pure auto-approval has same-model bias risks (Gemini judging Gemini misses the same blind spots), style drift becomes invisible, and tonal misjudgments slip through. The middle path — triage with auto-approval at high confidence and human review at borderline — gets most of the volume autopilot while keeping Will in the loop on edge cases. Holiday-proof by design.
+
+**Implementation:**
+- New columns on `pool`: `judge_score` (numeric), `judge_verdict` (`approved` | `borderline` | `rejected_by_judge`)
+- Judge call happens at generation time (one call per fact, immutable thereafter)
+- Threshold values configurable (start strict, loosen as confidence grows)
+- Existing review UI from Step 8 unchanged — just receives fewer items
+- Calibration: generate 200 facts (Step 13), Will rates manually via review UI over ≈1 week, judge prompt iterates against rated set until agreement >85% on held-out subset (Step 14)
+
+**Why few-shot, not fine-tuning:** Dataset too small (200 examples is below the floor where fine-tuning beats few-shot on a frontier model). Iteration cycle on prompt is minutes; on fine-tune is days. Frontier models reason over examples rather than learning hard boundaries from them — better fit for fuzzy taste-based judgment. Avoids fine-tuning infrastructure, recurring cost, and lock-in to a specific model version.
+
+**Rejected:** Pure human review (bus factor of 1, holiday risk). Pure auto-approval (same-model bias, invisible drift, tonal misjudgments). Fine-tuned classifier (wrong tool at this scale).
+
+---
+
+## D24 — Pure themed Material 3 for unified mobile UI
+
+**Decision:** Both Android and iOS Flutter app use Material 3 design system, themed only at the surface level (colors, fonts, shapes). All standard Material widgets — no custom widgets, no adaptive iOS-native variants.
+
+**Why:** HistoryBites' UI is fundamentally typography- and spacing-driven — there's no place where a Material switch vs a Cupertino switch genuinely changes user experience. Adaptive design doubles the widget testing surface for marginal aesthetic gain. Custom widgets (Level 2) defer ship date by ≈3-4 days for a v1 where shipping faster matters more than design refinement. Material 3 looks genuinely good on iOS now (used by Google's own iOS apps and many indies). Single design system means a single mental model when iterating.
+
+**Tradeoff:** App will feel slightly less "iOS-native" than a fully adaptive design. Mitigation: lean into editorial feel via typography (serif body type for fact text, generous whitespace) so the differentiation comes from content presentation, not platform chrome. If Material 3 proves limiting in practice, can revisit Level 2 (themed + custom FactCard) as Phase 3 polish work.
+
+**Rejected:** Adaptive design (Material on Android, Cupertino on iOS — doubles testing surface, marginal user-visible benefit). Level 2 themed + custom widgets (deferred until evidence Material 3 is limiting). Level 3 full custom design system (tar pit, weeks-to-months of work, almost always a mistake for solo dev).
+
+---
+
+## D25 — Growth-track maintenance posture with graceful wind-down protocol
+
+**Decision:** HistoryBites is operated as a growth-track project — intent is to grow the app and eventually monetize — with a high-attention launch period followed by a sustainable steady-state cadence. A graceful wind-down protocol is documented in advance for the case where maintenance becomes unsustainable.
+
+**Why:** Will's stated ambition is growth + eventual monetization. Will's stated capacity is "whatever it takes during launch, then taper." This combination requires explicit planning. Most ambitious side projects fail not from lack of features but from a missing transition from launch energy to sustainable maintenance. The Maintenance Playbook documents the cadence; this decision codifies the commitment so future-Will (and Claude Code) understands why operational choices are made the way they are.
+
+**Implications for architectural choices:**
+- Bias toward operational simplicity (already done): single FastAPI service, single Postgres, no microservices. Easier to maintain solo, easier to hand off, easier to wind down.
+- Substitutable dependencies: mainstream packages, no obscure tooling. Avoids lock-in that would make a future hand-off or wind-down painful.
+- DECISIONS.md mirror in repo (D19): ensures architectural rationale survives even if Notion access is lost — critical for both wind-down and hand-off.
+- Stdlib-first (D11): minimizes the load on future maintainers (or future-Will after a 6-month break).
+- Documented wind-down protocol: turns "the app dies" into "the app retires gracefully" if maintenance lapses. Protects the user experience and the project's legacy.
+
+**Rejected:**
+- Hobby-only posture — would have skipped growth investments (ASO, marketing, monetization roadmap), no longer aligned with stated ambition
+- Sustained launch-pace forever — unsustainable for a Master's student with a day job, risks burnout, and burnout-driven shutdown is the ungraceful kind
+- No wind-down plan — leaves the project to die badly if maintenance lapses, which is bad for users and bad for Will's track record
+
+---
+
+## Mirror notes (not part of the canonical log)
+
+These are observations from the Step 12 mirror pass. None of them edit the
+canonical text in Notion — fix in Notion first, then re-mirror here.
+
+- **D16 placement.** In Notion, D16 currently sits at the bottom of the page,
+  after D25. The mirror reorders it numerically (between D15 and D17) for
+  reader sanity. Worth tidying in Notion so the source of truth matches.
+- **D8 vs runtime constants.** D8 says "target 7 approved pool items," but
+  the runtime constants are `REVIEW_QUEUE_TARGET=20` (pending_review topup)
+  and `APPROVED_ALERT_THRESHOLD=3` (approved alert floor). These are not
+  contradictory — different metrics — but the "7" target isn't reflected in
+  any code or env var. Either codify it (`APPROVED_TARGET=7`?) or rephrase
+  D8 to match what runs.
+- **D5 narrative drift.** D5's body still describes the n-gram check as
+  active. The supersession callout at the top covers this, but a future
+  reader skimming the body alone could be misled. Consider a stronger
+  inline marker (e.g. `~~strikethrough~~` on the n-gram sentence) on the
+  next Notion edit pass.

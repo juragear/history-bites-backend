@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -51,6 +52,21 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="HistoryBites backend")
+
+# Step 12: CORS for any future browser-based admin/dashboard. Bearer-token
+# auth in headers doesn't need cookies, so allow_credentials stays False —
+# that's also what makes the wildcard "*" actually work (browsers reject
+# `*` + credentials=true). Origin list comes from settings.CORS_ORIGINS as a
+# comma-separated string so it can be configured via env without code changes.
+_cors_origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 app.include_router(admin_router)
 
 

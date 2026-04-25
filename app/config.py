@@ -54,5 +54,13 @@ class Settings(BaseSettings):
     REVIEW_QUEUE_TARGET: int = 20
     APPROVED_ALERT_THRESHOLD: int = 3
 
+    # Step 12: CORS allowlist for any future browser-based admin/dashboard
+    # client. Comma-separated origins; "*" allows any. Default is "*" for
+    # local dev convenience — tighten in production by setting
+    # CORS_ORIGINS=https://your.domain,http://localhost:3000 on Railway.
+    # `allow_credentials=False` is wired in main.py so the wildcard actually
+    # works (browsers reject `*` + credentials=true).
+    CORS_ORIGINS: str = "*"
+
 
 settings = Settings()
