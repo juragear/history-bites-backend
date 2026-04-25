@@ -331,6 +331,156 @@ def test_admin_review_400_on_already_reviewed(client, admin_token, db):
     assert resp.status_code == 400
 
 
+# --- /admin/review/{pool_id} — tags + notes (Step 13a) ---------------------
+
+
+def test_admin_review_json_with_tags_and_notes_persisted(
+    client, admin_token, db
+):
+    """JSON approve with valid tags + notes round-trips into review_tags
+    (JSON column) and review_notes (TEXT column)."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={
+            "action": "approve",
+            "tags": ["surprising-angle", "concrete-detail"],
+            "notes": "Nice angle on a familiar topic.",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "approved"
+    assert body["review_tags"] == ["surprising-angle", "concrete-detail"]
+    assert body["review_notes"] == "Nice angle on a familiar topic."
+
+    # Confirm on the row directly — exercises the SQLAlchemy JSON column on
+    # SQLite (and Postgres in prod). round-trips list[str] with no @compiles
+    # hook needed.
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.review_tags == ["surprising-angle", "concrete-detail"]
+    assert row.review_notes == "Nice angle on a familiar topic."
+
+
+def test_admin_review_form_with_tags_and_notes_persisted(
+    client, admin_token, db
+):
+    """Form-encoded reject with repeated `tags` keys + notes — the path the
+    HTML review page actually uses on submit."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    # httpx form encoding: a list-valued data entry becomes repeated keys
+    # (`tags=textbooky&tags=obvious`), which is what the browser submits and
+    # what request.form().getlist("tags") expects.
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        data={
+            "action": "reject",
+            "token": admin_token,
+            "tags": ["textbooky", "obvious"],
+            "notes": "Reads like a Wikipedia summary.",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.status == "rejected"
+    assert row.review_tags == ["textbooky", "obvious"]
+    assert row.review_notes == "Reads like a Wikipedia summary."
+
+
+def test_admin_review_unknown_tag_returns_400(client, admin_token, db):
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"action": "approve", "tags": ["nonsense-tag"]},
+    )
+    assert resp.status_code == 400
+    assert "Unknown tag" in resp.json()["detail"]
+    assert "nonsense-tag" in resp.json()["detail"]
+
+
+def test_admin_review_long_notes_silently_truncated_to_500(
+    client, admin_token, db
+):
+    """Spec: silent truncation, not an error — a typo in the notes field
+    shouldn't 4xx mid-review."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    long_notes = "x" * 600
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"action": "approve", "notes": long_notes},
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.review_notes is not None
+    assert len(row.review_notes) == 500
+    assert row.review_notes == "x" * 500
+
+
+def test_admin_review_no_tags_or_notes_keys_back_compat(
+    client, admin_token, db
+):
+    """Session 8 behavior unchanged: a payload with neither `tags` nor
+    `notes` succeeds, and both columns end up NULL."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"action": "approve"},
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.status == "approved"
+    assert row.review_tags is None
+    assert row.review_notes is None
+
+
+def test_admin_review_empty_tags_list_normalizes_to_null(
+    client, admin_token, db
+):
+    """Spec: empty cleaned tag list -> NULL, not `[]`. One canonical "no
+    tags" state to avoid `tags IS NULL` vs `tags = '[]'` confusion later."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"action": "approve", "tags": []},
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.review_tags is None
+
+
 # --- /admin/push ------------------------------------------------------------
 
 

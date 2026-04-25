@@ -16,8 +16,10 @@
       --accent: #0b5fff;
       --approve: #137333;
       --approve-bg: #e6f4ea;
+      --approve-pill-bg: #d1fae5;
       --reject: #b3261e;
       --reject-bg: #fce8e6;
+      --reject-pill-bg: #fee2e2;
     }
     * { box-sizing: border-box; }
     body {
@@ -78,9 +80,65 @@
     }
     .source { font-size: 13px; margin-bottom: 12px; }
     .source a { color: var(--accent); }
-    .actions { display: flex; gap: 8px; }
-    .actions form { margin: 0; }
-    button {
+
+    /* Step 13a — tag pills + notes textarea ------------------------------ */
+    .review-form { margin: 0; }
+    .tag-section { margin-bottom: 12px; }
+    .tag-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .tag-group-label {
+      width: 100%;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .tag-pill {
+      min-height: 36px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 14px;
+      background: white;
+      cursor: pointer;
+      color: var(--fg);
+      font-family: inherit;
+    }
+    .tag-pill:hover { background: #f3f4f6; }
+    .approve-tags .tag-pill.selected {
+      border-color: var(--approve);
+      background: var(--approve-pill-bg);
+      color: var(--approve);
+    }
+    .reject-tags .tag-pill.selected {
+      border-color: var(--reject);
+      background: var(--reject-pill-bg);
+      color: var(--reject);
+    }
+    textarea[name="notes"] {
+      width: 100%;
+      font-size: 14px;
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      resize: vertical;
+    }
+    .char-counter {
+      text-align: right;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+    .action-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .btn {
       font: inherit;
       padding: 10px 16px;
       border: 1px solid var(--border);
@@ -89,9 +147,17 @@
       min-width: 100px;
       min-height: 44px; /* touch target */
     }
-    button.approve { background: var(--approve-bg); color: var(--approve); border-color: var(--approve); }
-    button.reject  { background: var(--reject-bg);  color: var(--reject);  border-color: var(--reject);  }
-    button:hover { filter: brightness(0.97); }
+    .btn-approve {
+      background: var(--approve-bg);
+      color: var(--approve);
+      border-color: var(--approve);
+    }
+    .btn-reject {
+      background: var(--reject-bg);
+      color: var(--reject);
+      border-color: var(--reject);
+    }
+    .btn:hover { filter: brightness(0.97); }
   </style>
 </head>
 <body>
@@ -123,20 +189,74 @@
           Source:
           <a href="{{ row.source_url }}" target="_blank" rel="noopener noreferrer">{{ row.source_url }}</a>
         </div>
-        <div class="actions">
-          <form method="post" action="/admin/review/{{ row.id }}">
-            <input type="hidden" name="action" value="approve">
-            <input type="hidden" name="token" value="{{ admin_token }}">
-            <button class="approve" type="submit">Approve</button>
-          </form>
-          <form method="post" action="/admin/review/{{ row.id }}">
-            <input type="hidden" name="action" value="reject">
-            <input type="hidden" name="token" value="{{ admin_token }}">
-            <button class="reject" type="submit">Reject</button>
-          </form>
-        </div>
+        <form method="post" action="/admin/review/{{ row.id }}" class="review-form">
+          <input type="hidden" name="token" value="{{ admin_token }}">
+
+          <div class="tag-section">
+            <div class="tag-group approve-tags">
+              <div class="tag-group-label">Approve reasons</div>
+              <button type="button" class="tag-pill" data-tag="surprising-angle">surprising angle</button>
+              <button type="button" class="tag-pill" data-tag="human-scale">human scale</button>
+              <button type="button" class="tag-pill" data-tag="concrete-detail">concrete detail</button>
+              <button type="button" class="tag-pill" data-tag="well-paraphrased">well paraphrased</button>
+              <button type="button" class="tag-pill" data-tag="clear-stakes">clear stakes</button>
+            </div>
+            <div class="tag-group reject-tags">
+              <div class="tag-group-label">Reject reasons</div>
+              <button type="button" class="tag-pill" data-tag="textbooky">textbooky</button>
+              <button type="button" class="tag-pill" data-tag="dates-and-names-only">dates &amp; names only</button>
+              <button type="button" class="tag-pill" data-tag="obvious">obvious</button>
+              <button type="button" class="tag-pill" data-tag="stylistic-tic">stylistic tic</button>
+              <button type="button" class="tag-pill" data-tag="category-mismatch">category mismatch</button>
+              <button type="button" class="tag-pill" data-tag="infobox-flavored">infobox-flavored</button>
+              <button type="button" class="tag-pill" data-tag="boring-even-if-true">boring even if true</button>
+            </div>
+            <textarea name="notes" maxlength="500" rows="3" placeholder="Optional notes..."></textarea>
+            <div class="char-counter"><span class="char-count">0</span> / 500</div>
+          </div>
+
+          <div class="action-row">
+            <button type="submit" name="action" value="approve" class="btn btn-approve">Approve</button>
+            <button type="submit" name="action" value="reject" class="btn btn-reject">Reject</button>
+          </div>
+        </form>
       </div>
     {% endfor %}
   {% endif %}
+
+  <script>
+    // Step 13a — pill toggle, char counter, hidden-input materialization on
+    // submit. Vanilla JS, scoped per form. No framework dependency.
+    document.querySelectorAll('.review-form').forEach(function (form) {
+      form.querySelectorAll('.tag-pill').forEach(function (pill) {
+        pill.addEventListener('click', function (e) {
+          e.preventDefault();
+          pill.classList.toggle('selected');
+        });
+      });
+
+      var textarea = form.querySelector('textarea[name="notes"]');
+      var counter = form.querySelector('.char-count');
+      if (textarea && counter) {
+        textarea.addEventListener('input', function () {
+          counter.textContent = textarea.value.length;
+        });
+      }
+
+      form.addEventListener('submit', function () {
+        // Drop any stale hidden tags from a previous submit attempt.
+        form.querySelectorAll('input[type="hidden"][name="tags"]').forEach(function (el) {
+          el.remove();
+        });
+        form.querySelectorAll('.tag-pill.selected').forEach(function (pill) {
+          var input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = 'tags';
+          input.value = pill.dataset.tag;
+          form.appendChild(input);
+        });
+      });
+    });
+  </script>
 </body>
 </html>

@@ -59,9 +59,9 @@ Format: one decision per section. What we chose, why, what we rejected.
 
 > **Superseded in part by D20 —** the n-gram validation step described below has been removed. The prompt instruction and human review gate remain.
 
-**Decision:** The v1 Gemini prompt explicitly instructs "Do not copy phrasing from the source. State the fact in your own words in one sentence." A validation step rejects any output containing an 8-word consecutive substring from the source extract.
+**Decision:** The v1 Gemini prompt explicitly instructs "Do not copy phrasing from the source. State the fact in your own words in one sentence." ~~A validation step rejects any output containing an 8-word consecutive substring from the source extract.~~ *(n-gram check removed per D20.)*
 
-**Why:** Copyright protects expression, not facts. Close paraphrasing is infringement even with attribution. The n-gram check is cheap and catches the failure mode.
+**Why:** Copyright protects expression, not facts. Close paraphrasing is infringement even with attribution. ~~The n-gram check is cheap and catches the failure mode.~~ *(See D20 for the rationale.)*
 
 **Rejected:** Relying on attribution alone. Trusting Gemini to paraphrase without a validation gate.
 
@@ -89,15 +89,31 @@ Format: one decision per section. What we chose, why, what we rejected.
 
 ---
 
-## D8 — 7-day buffer, every 6h cron
+## D8 — Three-tier approved buffer, every 6h cron
 
-**Decision:** Target 7 approved pool items. Run the cron every 6h.
+**Decision:** Three runtime constants govern the approved-pool buffer:
 
-**Why (buffer depth):** 7 days recovers cleanly from any realistic outage. Longer buffers lock in prompt/category mistakes for longer and mask generation failures. Shorter feedback loop is better for a solo dev iterating.
+- `APPROVED_TARGET = 7` — target buffer depth (≈7 days of unattended operation)
+- `APPROVED_ALERT_THRESHOLD = 3` — Slack-alert floor
+- `REVIEW_QUEUE_TARGET = 20` — pending_review queue size the generation cron fills toward
 
-**Why (cron frequency):** Idempotent jobs are cheap. 6h means max 6h to detect + recover from a broken run. Daily would be simpler but creates a 24h blind spot.
+Run the generation cron every 6h.
 
-**Rejected:** 30-day buffer (too slow to iterate). Hourly cron (unnecessary).
+**Three-tier operational state for the approved pool:**
+
+- `approved >= 7` → ok (target buffer met)
+- `3 <= approved < 7` → warm (below target but not alerting; topup loop continues filling pending_review for human review)
+- `approved < 3` → low (Slack alert fires every cron run until threshold restored)
+
+**Why (buffer depth = 7):** 7 days recovers cleanly from any realistic outage — Will away for a week, Gemini outage, prompt iteration broke something. Longer buffers lock in prompt/category mistakes for longer and mask generation failures. Shorter feedback loop is better for a solo dev iterating.
+
+**Why (alert floor = 3):** 3 days is genuine urgency — below this, Will needs to act before tomorrow's pin runs out of approved candidates. Above this, daily cron has time to recover via human review velocity.
+
+**Why (review queue target = 20):** Generation cron fills pending_review toward 20 to give Will a meaningful batch to review without hand-cranking generates one at a time. 20 is comfortable for a single review session; higher would be intimidating.
+
+**Why (cron frequency = 6h):** Idempotent jobs are cheap. 6h means max 6h to detect + recover from a broken run. Daily would be simpler but creates a 24h blind spot.
+
+**Rejected:** 30-day buffer (too slow to iterate). Hourly cron (unnecessary). Single-tier alerting (alert OR no-alert) — three tiers give operational signal without doubling alert volume.
 
 ---
 
@@ -337,24 +353,3 @@ None of that is built. For v1, retract is best-effort cleanup of a mistake going
 - Sustained launch-pace forever — unsustainable for a Master's student with a day job, risks burnout, and burnout-driven shutdown is the ungraceful kind
 - No wind-down plan — leaves the project to die badly if maintenance lapses, which is bad for users and bad for Will's track record
 
----
-
-## Mirror notes (not part of the canonical log)
-
-These are observations from the Step 12 mirror pass. None of them edit the
-canonical text in Notion — fix in Notion first, then re-mirror here.
-
-- **D16 placement.** In Notion, D16 currently sits at the bottom of the page,
-  after D25. The mirror reorders it numerically (between D15 and D17) for
-  reader sanity. Worth tidying in Notion so the source of truth matches.
-- **D8 vs runtime constants.** D8 says "target 7 approved pool items," but
-  the runtime constants are `REVIEW_QUEUE_TARGET=20` (pending_review topup)
-  and `APPROVED_ALERT_THRESHOLD=3` (approved alert floor). These are not
-  contradictory — different metrics — but the "7" target isn't reflected in
-  any code or env var. Either codify it (`APPROVED_TARGET=7`?) or rephrase
-  D8 to match what runs.
-- **D5 narrative drift.** D5's body still describes the n-gram check as
-  active. The supersession callout at the top covers this, but a future
-  reader skimming the body alone could be misled. Consider a stronger
-  inline marker (e.g. `~~strikethrough~~` on the n-gram sentence) on the
-  next Notion edit pass.

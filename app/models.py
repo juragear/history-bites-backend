@@ -1,6 +1,7 @@
 from datetime import date, datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -79,6 +80,13 @@ class PoolFact(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Step 13a: tagged review UI. Both nullable for backward compat with rows
+    # reviewed before Step 13a. JSON (not ARRAY) so SQLite tests round-trip
+    # without a @compiles hook — Postgres uses JSONB, SQLite serializes to TEXT,
+    # SQLAlchemy hides the difference. Empty cleaned tag list normalizes to
+    # NULL in the endpoint so "no tags" is one canonical state, not two.
+    review_tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

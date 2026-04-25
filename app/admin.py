@@ -47,6 +47,7 @@ from app import cron, fcm, generation
 from app.config import settings
 from app.db import get_db
 from app.models import Fact, PoolFact
+from app.review_tags import InvalidTagError, validate_tags
 
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,8 @@ class ReviewActionResponse(BaseModel):
     pool_id: int
     status: str
     reviewed_at: datetime | None
+    review_tags: list[str] | None = None
+    review_notes: str | None = None
 
 
 class PushResponse(BaseModel):
@@ -380,10 +383,37 @@ def admin_retract(
 # --- POST /admin/review/{pool_id} -------------------------------------------
 
 
+_NOTES_MAX_LEN = 500
+
+
+def _normalize_notes(raw: str | None) -> str | None:
+    """Silently truncate to 500 chars and collapse empty -> None.
+
+    Silent (not error) is intentional: a typo in the notes field shouldn't
+    interrupt the review flow. ≤500 keeps the column bounded for grep sanity
+    later. Empty string normalizes to None so blank-on-submit doesn't write
+    "" to the DB, distinct from "no notes attached."
+    """
+    if raw is None:
+        return None
+    truncated = raw[:_NOTES_MAX_LEN]
+    return truncated or None
+
+
 def _apply_review(
-    db: Session, pool_id: int, action: Literal["approve", "reject"]
+    db: Session,
+    pool_id: int,
+    action: Literal["approve", "reject"],
+    *,
+    cleaned_tags: list[str],
+    truncated_notes: str | None,
 ) -> PoolFact:
-    """Shared logic for the JSON endpoint and the HTML form post."""
+    """Shared logic for the JSON endpoint and the HTML form post.
+
+    `cleaned_tags` has already been through `validate_tags`; an empty list is
+    canonicalized to NULL on the row so "no tags" is one state, not two.
+    `truncated_notes` has already been clipped to <= _NOTES_MAX_LEN.
+    """
     row = db.get(PoolFact, pool_id)
     if row is None:
         raise HTTPException(
@@ -399,6 +429,10 @@ def _apply_review(
         )
     row.status = "approved" if action == "approve" else "rejected"
     row.reviewed_at = datetime.now(timezone.utc)
+    # Empty cleaned list -> None so SQL doesn't have to distinguish between
+    # NULL and `[]`. Avoids a future `tags IS NULL` vs `tags = '[]'` trap.
+    row.review_tags = cleaned_tags or None
+    row.review_notes = truncated_notes
     db.commit()
     db.refresh(row)
     logger.info(
@@ -408,6 +442,8 @@ def _apply_review(
                 "pool_id": row.id,
                 "action": action,
                 "new_status": row.status,
+                "tag_count": len(cleaned_tags),
+                "notes_len": len(truncated_notes) if truncated_notes else 0,
             }
         },
     )
@@ -420,14 +456,21 @@ async def admin_review(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ) -> ReviewActionResponse | RedirectResponse:
-    """Approve or reject a pending_review pool row.
+    """Approve or reject a pending_review pool row, with optional tags + notes.
 
     Body shape (one of):
-      - form-encoded `action=approve&token=...` — used by the HTML review
-        page's <form>s. Returns 303 redirect back to /admin/review so the
-        browser doesn't try to re-POST on refresh.
-      - JSON `{"action": "approve" | "reject"}` — used by curl / future API
-        clients. Returns the updated row as JSON.
+      - form-encoded `action=approve&token=...&tags=...&tags=...&notes=...` —
+        used by the HTML review page. Repeated `tags` keys are read via
+        `form.getlist("tags")` (FastAPI's standard list-from-form pattern).
+        Returns 303 redirect back to /admin/review so the browser doesn't
+        try to re-POST on refresh.
+      - JSON `{"action": "approve", "tags": [...], "notes": "..."}` — used by
+        curl / future API clients. Returns the updated row as JSON.
+
+    Tags must come from the palette in app.review_tags; unknown tags 400 with
+    InvalidTagError's message. Notes get silently truncated to 500 chars (a
+    typo shouldn't 4xx mid-review). Tag/action combinations are not policed
+    — the `action` field is the gate; tags are commentary on top.
 
     We parse the body manually because FastAPI parameter binding can't cleanly
     accept BOTH a Pydantic body AND a Form() param on the same route — the
@@ -437,6 +480,8 @@ async def admin_review(
     """
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip()
     raw_action: str | None = None
+    raw_tags: list[str] | None = None
+    raw_notes: str | None = None
     is_form = False
 
     if content_type == "application/json":
@@ -449,10 +494,26 @@ async def admin_review(
             ) from exc
         if isinstance(body, dict):
             raw_action = body.get("action")
+            tags_field = body.get("tags")
+            if tags_field is not None:
+                if not isinstance(tags_field, list):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="tags must be a list of strings",
+                    )
+                raw_tags = [str(t) for t in tags_field]
+            notes_field = body.get("notes")
+            if notes_field is not None:
+                raw_notes = str(notes_field)
     else:
         # x-www-form-urlencoded or multipart/form-data — both handled here.
         form = await request.form()
         raw_action = form.get("action")  # type: ignore[assignment]
+        # Repeated `tags` keys come back via getlist; absent key -> [].
+        tags_list = form.getlist("tags")
+        raw_tags = [str(t) for t in tags_list] if tags_list else None
+        notes_value = form.get("notes")
+        raw_notes = str(notes_value) if notes_value is not None else None
         is_form = True
 
     if raw_action not in ("approve", "reject"):
@@ -462,7 +523,23 @@ async def admin_review(
         )
     chosen: Literal["approve", "reject"] = raw_action  # type: ignore[assignment]
 
-    row = _apply_review(db, pool_id, chosen)
+    try:
+        cleaned_tags = validate_tags(raw_tags)
+    except InvalidTagError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    truncated_notes = _normalize_notes(raw_notes)
+
+    row = _apply_review(
+        db,
+        pool_id,
+        chosen,
+        cleaned_tags=cleaned_tags,
+        truncated_notes=truncated_notes,
+    )
 
     if is_form:
         return RedirectResponse(
@@ -473,6 +550,8 @@ async def admin_review(
         pool_id=row.id,
         status=row.status,
         reviewed_at=row.reviewed_at,
+        review_tags=row.review_tags,
+        review_notes=row.review_notes,
     )
 
 
