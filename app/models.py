@@ -42,6 +42,12 @@ class Fact(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Set when run_push (Step 9) successfully delivers this fact to FCM.
+    # Nullable because past facts (pre-Step 9) never had a push and shouldn't
+    # get a synthesized timestamp. Most-recent-wins on retry — see cron.run_push.
+    pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class PoolFact(Base):

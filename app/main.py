@@ -209,6 +209,12 @@ def health(response: Response) -> HealthResponse:
                 .where(PoolFact.status == "approved")
             ).scalar_one()
             latest = db.execute(select(func.max(Fact.scheduled_date))).scalar_one()
+            # Step 9: most-recent-wins MAX(pushed_at) — single scalar query
+            # against the same Session, no extra round trip beyond the one
+            # we'd already need. Small table, no index required.
+            last_push_at = db.execute(
+                select(func.max(Fact.pushed_at))
+            ).scalar_one()
     except SQLAlchemyError as exc:
         logger.warning("health db probe failed", extra={"extra": {"error": str(exc)}})
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -227,5 +233,5 @@ def health(response: Response) -> HealthResponse:
         pool_pending_count=pending,
         pool_approved_count=approved,
         latest_scheduled_date=latest,
-        last_push_at=None,
+        last_push_at=last_push_at,
     )

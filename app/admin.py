@@ -43,7 +43,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import generation
+from app import cron, fcm, generation
 from app.config import settings
 from app.db import get_db
 from app.models import Fact, PoolFact
@@ -140,6 +140,13 @@ class ReviewActionResponse(BaseModel):
     pool_id: int
     status: str
     reviewed_at: datetime | None
+
+
+class PushResponse(BaseModel):
+    message_id: str
+    fact_id: int
+    scheduled_date: date
+    pushed_at: datetime | None
 
 
 # --- POST /admin/generate ----------------------------------------------------
@@ -447,6 +454,50 @@ async def admin_review(
         pool_id=row.id,
         status=row.status,
         reviewed_at=row.reviewed_at,
+    )
+
+
+# --- POST /admin/push --------------------------------------------------------
+
+
+@router.post("/push", response_model=PushResponse)
+def admin_push(
+    db: Annotated[Session, Depends(get_db)],
+) -> PushResponse:
+    """Manually trigger today's FCM push.
+
+    Two reasons this exists in Step 9 (before Step 10 wires the actual cron):
+      1. Smoke test surface — exercises run_push end-to-end against live FCM.
+      2. Operational tool — if the cron fires but FCM was briefly down, Will
+         can re-trigger after recovery without waiting for tomorrow.
+
+    400 if there's no active fact for today (retracted or never scheduled).
+    503 if FCM rejects after retries — surfaces the underlying error.
+    """
+    try:
+        result = cron.run_push(db)
+    except fcm.FCMError as exc:
+        logger.warning("admin push failed", extra={"extra": {"error": str(exc)}})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"fcm send failed: {exc}",
+        ) from exc
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="no active fact for today (not scheduled or retracted)",
+        )
+
+    return PushResponse(
+        message_id=result["message_id"],
+        fact_id=result["fact_id"],
+        scheduled_date=date.fromisoformat(result["scheduled_date"]),
+        pushed_at=(
+            datetime.fromisoformat(result["pushed_at"])
+            if result.get("pushed_at")
+            else None
+        ),
     )
 
 

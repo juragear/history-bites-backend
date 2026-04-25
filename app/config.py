@@ -32,5 +32,16 @@ class Settings(BaseSettings):
     # Set on Railway via `railway variables --set ADMIN_TOKEN=...`.
     ADMIN_TOKEN: str
 
+    # Firebase Cloud Messaging (Step 9, D17 + D22).
+    # FIREBASE_SERVICE_ACCOUNT_JSON is the entire service account JSON file
+    # contents as a single string — required, no safe default. The app fails
+    # loudly on boot without it. fcm.py parses it once at first send.
+    # FCM_TOPIC defaults to "daily-fact" per D17. ALERT_WEBHOOK_URL is declared
+    # now for forward-compat with Step 10 (cron alerts on missing facts /
+    # generation failures); Step 9 only declares it.
+    FIREBASE_SERVICE_ACCOUNT_JSON: str
+    FCM_TOPIC: str = "daily-fact"
+    ALERT_WEBHOOK_URL: str | None = None
+
 
 settings = Settings()

@@ -16,6 +16,7 @@ dependencies = [
     "google-genai",
     "jinja2",
     "python-multipart",
+    "firebase-admin",
 ]
 
 [build-system]
