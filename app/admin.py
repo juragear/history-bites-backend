@@ -6,9 +6,9 @@ EITHER an `Authorization: Bearer <token>` header (curl / Android-style) OR a
 acceptance is the simplest path that lets:
   - the GET /admin/review HTML page authenticate via `?token=...` in the URL
     (browsers don't send Authorization headers on plain navigations), and
-  - the in-page <form action=...> approve/reject POSTs authenticate via a
-    hidden `token` field (browsers don't send Authorization headers on plain
-    form posts either), and
+  - the in-page <form action=...> rating POSTs authenticate via a hidden
+    `token` field (browsers don't send Authorization headers on plain form
+    posts either), and
   - curl / Android / Postman use the standard Authorization header.
 
 The "leak risk" of a token-in-URL is mitigated by HTTPS-everywhere on Railway.
@@ -24,7 +24,7 @@ import logging
 import secrets
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -47,7 +47,12 @@ from app import cron, fcm, generation
 from app.config import settings
 from app.db import get_db
 from app.models import Fact, PoolFact
-from app.review_tags import InvalidTagError, validate_tags
+from app.review_tags import (
+    InvalidRatingError,
+    InvalidTagError,
+    derive_status_from_rating,
+    validate_tags,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -141,6 +146,7 @@ class ReviewActionResponse(BaseModel):
     pool_id: int
     status: str
     reviewed_at: datetime | None
+    review_rating: int | None = None
     review_tags: list[str] | None = None
     review_notes: str | None = None
 
@@ -403,16 +409,24 @@ def _normalize_notes(raw: str | None) -> str | None:
 def _apply_review(
     db: Session,
     pool_id: int,
-    action: Literal["approve", "reject"],
+    rating: int,
     *,
     cleaned_tags: list[str],
     truncated_notes: str | None,
 ) -> PoolFact:
     """Shared logic for the JSON endpoint and the HTML form post.
 
+    `rating` is a validated 1-5 int. Status derives via
+    `derive_status_from_rating` (>=4 approved, <=3 rejected — D26).
+
     `cleaned_tags` has already been through `validate_tags`; an empty list is
     canonicalized to NULL on the row so "no tags" is one state, not two.
     `truncated_notes` has already been clipped to <= _NOTES_MAX_LEN.
+
+    Re-rating is allowed by design (D26). The Session 8 once-only guard was
+    removed so a row that was previously rated can be re-rated; the new
+    rating, tags, and notes overwrite the prior values, and `reviewed_at` is
+    refreshed to the latest decision time.
     """
     row = db.get(PoolFact, pool_id)
     if row is None:
@@ -420,14 +434,9 @@ def _apply_review(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"pool row {pool_id} not found",
         )
-    if row.status != "pending_review":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"pool row {pool_id} already reviewed (status={row.status!r})"
-            ),
-        )
-    row.status = "approved" if action == "approve" else "rejected"
+    new_status = derive_status_from_rating(rating)
+    row.review_rating = rating
+    row.status = new_status
     row.reviewed_at = datetime.now(timezone.utc)
     # Empty cleaned list -> None so SQL doesn't have to distinguish between
     # NULL and `[]`. Avoids a future `tags IS NULL` vs `tags = '[]'` trap.
@@ -440,7 +449,7 @@ def _apply_review(
         extra={
             "extra": {
                 "pool_id": row.id,
-                "action": action,
+                "rating": rating,
                 "new_status": row.status,
                 "tag_count": len(cleaned_tags),
                 "notes_len": len(truncated_notes) if truncated_notes else 0,
@@ -456,21 +465,25 @@ async def admin_review(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ) -> ReviewActionResponse | RedirectResponse:
-    """Approve or reject a pending_review pool row, with optional tags + notes.
+    """Rate a pool row 1-5 (D26). Status derives: >=4 approved, <=3 rejected.
 
     Body shape (one of):
-      - form-encoded `action=approve&token=...&tags=...&tags=...&notes=...` —
+      - form-encoded `rating=5&token=...&tags=...&tags=...&notes=...` —
         used by the HTML review page. Repeated `tags` keys are read via
         `form.getlist("tags")` (FastAPI's standard list-from-form pattern).
         Returns 303 redirect back to /admin/review so the browser doesn't
         try to re-POST on refresh.
-      - JSON `{"action": "approve", "tags": [...], "notes": "..."}` — used by
+      - JSON `{"rating": 5, "tags": [...], "notes": "..."}` — used by
         curl / future API clients. Returns the updated row as JSON.
 
-    Tags must come from the palette in app.review_tags; unknown tags 400 with
-    InvalidTagError's message. Notes get silently truncated to 500 chars (a
-    typo shouldn't 4xx mid-review). Tag/action combinations are not policed
-    — the `action` field is the gate; tags are commentary on top.
+    `rating` is required and must be an int in [1, 5]. Anything else 400s.
+    Tags must come from the palette in app.review_tags; unknown tags 400.
+    Notes get silently truncated to 500 chars (a typo shouldn't 4xx
+    mid-review).
+
+    Re-rating is allowed (D26): the once-only guard from Session 8 was
+    removed so a previously-rated row can be re-rated and the new
+    rating/tags/notes overwrite the prior values.
 
     We parse the body manually because FastAPI parameter binding can't cleanly
     accept BOTH a Pydantic body AND a Form() param on the same route — the
@@ -479,7 +492,7 @@ async def admin_review(
     conflict and lets the same path serve both shapes.
     """
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip()
-    raw_action: str | None = None
+    raw_rating: object = None
     raw_tags: list[str] | None = None
     raw_notes: str | None = None
     is_form = False
@@ -493,7 +506,7 @@ async def admin_review(
                 detail=f"invalid JSON body: {exc}",
             ) from exc
         if isinstance(body, dict):
-            raw_action = body.get("action")
+            raw_rating = body.get("rating")
             tags_field = body.get("tags")
             if tags_field is not None:
                 if not isinstance(tags_field, list):
@@ -508,7 +521,7 @@ async def admin_review(
     else:
         # x-www-form-urlencoded or multipart/form-data — both handled here.
         form = await request.form()
-        raw_action = form.get("action")  # type: ignore[assignment]
+        raw_rating = form.get("rating")
         # Repeated `tags` keys come back via getlist; absent key -> [].
         tags_list = form.getlist("tags")
         raw_tags = [str(t) for t in tags_list] if tags_list else None
@@ -516,12 +529,33 @@ async def admin_review(
         raw_notes = str(notes_value) if notes_value is not None else None
         is_form = True
 
-    if raw_action not in ("approve", "reject"):
+    # Coerce + validate `rating`. Forms always deliver strings; JSON should
+    # deliver int but we coerce a digit-string for tolerance. Bools sneak past
+    # `isinstance(x, int)` in Python, so derive_status_from_rating filters
+    # them — but we also catch the obvious "missing entirely" case here for a
+    # cleaner error message than the helper's generic repr.
+    if raw_rating is None or raw_rating == "":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="action must be 'approve' or 'reject'",
+            detail="rating is required (int 1-5)",
         )
-    chosen: Literal["approve", "reject"] = raw_action  # type: ignore[assignment]
+    if isinstance(raw_rating, bool):
+        # Same guard as derive_status_from_rating — surface as 400 here so the
+        # endpoint doesn't bubble an InvalidRatingError on a bool payload.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"rating must be an int 1-5, got {raw_rating!r}",
+        )
+    if isinstance(raw_rating, int):
+        rating_int = raw_rating
+    else:
+        try:
+            rating_int = int(str(raw_rating))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"rating must be an int 1-5, got {raw_rating!r}",
+            ) from exc
 
     try:
         cleaned_tags = validate_tags(raw_tags)
@@ -533,13 +567,21 @@ async def admin_review(
 
     truncated_notes = _normalize_notes(raw_notes)
 
-    row = _apply_review(
-        db,
-        pool_id,
-        chosen,
-        cleaned_tags=cleaned_tags,
-        truncated_notes=truncated_notes,
-    )
+    try:
+        row = _apply_review(
+            db,
+            pool_id,
+            rating_int,
+            cleaned_tags=cleaned_tags,
+            truncated_notes=truncated_notes,
+        )
+    except InvalidRatingError as exc:
+        # Range / type violation from the helper. Mapped to 400 here so the
+        # endpoint owns the HTTP-shape decision and the helper stays pure.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
     if is_form:
         return RedirectResponse(
@@ -550,6 +592,7 @@ async def admin_review(
         pool_id=row.id,
         status=row.status,
         reviewed_at=row.reviewed_at,
+        review_rating=row.review_rating,
         review_tags=row.review_tags,
         review_notes=row.review_notes,
     )

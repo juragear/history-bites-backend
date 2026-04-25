@@ -9,7 +9,9 @@ Covers:
   - POST /admin/flush-pool (deletes pending only)
   - POST /admin/schedule/{pool_id}/{target_date} (success + 404 + 400 + 409)
   - POST /admin/retract/{target_date} (success + 404)
-  - POST /admin/review/{pool_id} (JSON approve, JSON reject, form 303 redirect, 400)
+  - POST /admin/review/{pool_id} — rating-based (D26): JSON rating=5 ->
+    approved, rating=2 -> rejected, rating=3 -> rejected (borderline),
+    form 303, 400 on missing/out-of-range/non-int, re-rating overwrites
   - POST /admin/push (success + no-fact -> 400 + FCMError -> 503)
   - POST /admin/cron/run-generation (success summary)
 """
@@ -93,15 +95,15 @@ def test_auth_accepts_query_param(client, admin_token, db):
 
 
 def test_auth_accepts_form_field(client, admin_token, db):
-    """Hidden form field path used by the in-page approve/reject buttons."""
+    """Hidden form field path used by the in-page rating submit button."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
 
-    # Form-encoded POST with `token=...` and `action=approve`.
+    # Form-encoded POST with `token=...` and `rating=4`.
     resp = client.post(
         f"/admin/review/{pool_id}",
-        data={"action": "approve", "token": admin_token},
+        data={"rating": "4", "token": admin_token},
         follow_redirects=False,
     )
     # Successful form submit -> 303 redirect back to /admin/review.
@@ -258,10 +260,11 @@ def test_admin_retract_404_when_no_active_fact(client, admin_token):
     assert resp.status_code == 404
 
 
-# --- /admin/review/{pool_id} ------------------------------------------------
+# --- /admin/review/{pool_id} — rating-based (Step 13c / D26) ---------------
 
 
-def test_admin_review_json_approve(client, admin_token, db):
+def test_admin_review_json_rating_5_approved(client, admin_token, db):
+    """JSON rating=5 -> status derives to 'approved' (D26: >=4)."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -269,15 +272,17 @@ def test_admin_review_json_approve(client, admin_token, db):
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "approve"},
+        json={"rating": 5},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "approved"
+    assert body["review_rating"] == 5
     assert body["reviewed_at"] is not None
 
 
-def test_admin_review_json_reject(client, admin_token, db):
+def test_admin_review_json_rating_2_rejected(client, admin_token, db):
+    """JSON rating=2 -> status derives to 'rejected' (D26: <=3)."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -285,27 +290,59 @@ def test_admin_review_json_reject(client, admin_token, db):
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "reject"},
+        json={"rating": 2},
     )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "rejected"
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert body["review_rating"] == 2
 
 
-def test_admin_review_form_returns_303_redirect(client, admin_token, db):
+def test_admin_review_json_rating_3_borderline_is_rejected(
+    client, admin_token, db
+):
+    """The whole point of D26: rating=3 ('borderline') is rejected, not
+    approved. Threshold is 4 because a published miss costs more than an
+    unpublished hit on a daily-fact app."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
 
     resp = client.post(
         f"/admin/review/{pool_id}",
-        data={"action": "approve", "token": admin_token},
+        headers=_bearer(admin_token),
+        json={"rating": 3},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert body["review_rating"] == 3
+
+
+def test_admin_review_form_rating_returns_303_redirect(
+    client, admin_token, db
+):
+    """Form-encoded rating submit -> 303 back to /admin/review (HTML page
+    shape; prevents browser re-POST on refresh)."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        data={"rating": "4", "token": admin_token},
         follow_redirects=False,
     )
     assert resp.status_code == 303
     assert "/admin/review" in resp.headers["location"]
 
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.status == "approved"
+    assert row.review_rating == 4
 
-def test_admin_review_400_on_invalid_action(client, admin_token, db):
+
+def test_admin_review_400_on_missing_rating(client, admin_token, db):
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -313,31 +350,49 @@ def test_admin_review_400_on_invalid_action(client, admin_token, db):
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "maybe"},
+        json={},
     )
     assert resp.status_code == 400
+    assert "rating is required" in resp.json()["detail"]
 
 
-def test_admin_review_400_on_already_reviewed(client, admin_token, db):
-    db.add(_pool(external_id="p1", status="approved"))
+@pytest.mark.parametrize("bad_rating", [0, 6, -1, 100])
+def test_admin_review_400_on_out_of_range_rating(
+    client, admin_token, db, bad_rating
+):
+    db.add(_pool(external_id=f"p-{bad_rating}"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
 
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "reject"},
+        json={"rating": bad_rating},
     )
     assert resp.status_code == 400
 
 
-# --- /admin/review/{pool_id} — tags + notes (Step 13a) ---------------------
+def test_admin_review_400_on_non_int_rating(client, admin_token, db):
+    """A non-numeric string for rating must 400, not silently coerce."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"rating": "four"},
+    )
+    assert resp.status_code == 400
 
 
-def test_admin_review_json_with_tags_and_notes_persisted(
+# --- /admin/review/{pool_id} — tags + notes alongside rating (D26) ---------
+
+
+def test_admin_review_json_rating_with_tags_and_notes_persisted(
     client, admin_token, db
 ):
-    """JSON approve with valid tags + notes round-trips into review_tags
+    """JSON rating=5 with valid tags + notes round-trips into review_tags
     (JSON column) and review_notes (TEXT column)."""
     db.add(_pool(external_id="p1"))
     db.commit()
@@ -347,7 +402,7 @@ def test_admin_review_json_with_tags_and_notes_persisted(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
         json={
-            "action": "approve",
+            "rating": 5,
             "tags": ["surprising-angle", "concrete-detail"],
             "notes": "Nice angle on a familiar topic.",
         },
@@ -355,6 +410,7 @@ def test_admin_review_json_with_tags_and_notes_persisted(
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "approved"
+    assert body["review_rating"] == 5
     assert body["review_tags"] == ["surprising-angle", "concrete-detail"]
     assert body["review_notes"] == "Nice angle on a familiar topic."
 
@@ -365,13 +421,14 @@ def test_admin_review_json_with_tags_and_notes_persisted(
     row = db.get(PoolFact, pool_id)
     assert row.review_tags == ["surprising-angle", "concrete-detail"]
     assert row.review_notes == "Nice angle on a familiar topic."
+    assert row.review_rating == 5
 
 
-def test_admin_review_form_with_tags_and_notes_persisted(
+def test_admin_review_form_rating_with_tags_and_notes_persisted(
     client, admin_token, db
 ):
-    """Form-encoded reject with repeated `tags` keys + notes — the path the
-    HTML review page actually uses on submit."""
+    """Form-encoded rating=2 with repeated `tags` keys + notes — the path
+    the HTML review page actually uses on submit."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -382,7 +439,7 @@ def test_admin_review_form_with_tags_and_notes_persisted(
     resp = client.post(
         f"/admin/review/{pool_id}",
         data={
-            "action": "reject",
+            "rating": "2",
             "token": admin_token,
             "tags": ["textbooky", "obvious"],
             "notes": "Reads like a Wikipedia summary.",
@@ -394,6 +451,7 @@ def test_admin_review_form_with_tags_and_notes_persisted(
     db.expire_all()
     row = db.get(PoolFact, pool_id)
     assert row.status == "rejected"
+    assert row.review_rating == 2
     assert row.review_tags == ["textbooky", "obvious"]
     assert row.review_notes == "Reads like a Wikipedia summary."
 
@@ -406,7 +464,7 @@ def test_admin_review_unknown_tag_returns_400(client, admin_token, db):
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "approve", "tags": ["nonsense-tag"]},
+        json={"rating": 5, "tags": ["nonsense-tag"]},
     )
     assert resp.status_code == 400
     assert "Unknown tag" in resp.json()["detail"]
@@ -426,7 +484,7 @@ def test_admin_review_long_notes_silently_truncated_to_500(
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "approve", "notes": long_notes},
+        json={"rating": 5, "notes": long_notes},
     )
     assert resp.status_code == 200
 
@@ -437,11 +495,11 @@ def test_admin_review_long_notes_silently_truncated_to_500(
     assert row.review_notes == "x" * 500
 
 
-def test_admin_review_no_tags_or_notes_keys_back_compat(
+def test_admin_review_no_tags_or_notes_keys_succeeds(
     client, admin_token, db
 ):
-    """Session 8 behavior unchanged: a payload with neither `tags` nor
-    `notes` succeeds, and both columns end up NULL."""
+    """A payload with only `rating` succeeds; both tags and notes columns
+    end up NULL."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -449,13 +507,14 @@ def test_admin_review_no_tags_or_notes_keys_back_compat(
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "approve"},
+        json={"rating": 5},
     )
     assert resp.status_code == 200
 
     db.expire_all()
     row = db.get(PoolFact, pool_id)
     assert row.status == "approved"
+    assert row.review_rating == 5
     assert row.review_tags is None
     assert row.review_notes is None
 
@@ -472,13 +531,93 @@ def test_admin_review_empty_tags_list_normalizes_to_null(
     resp = client.post(
         f"/admin/review/{pool_id}",
         headers=_bearer(admin_token),
-        json={"action": "approve", "tags": []},
+        json={"rating": 5, "tags": []},
     )
     assert resp.status_code == 200
 
     db.expire_all()
     row = db.get(PoolFact, pool_id)
     assert row.review_tags is None
+
+
+# --- /admin/review/{pool_id} — re-rating allowed (D26) ---------------------
+
+
+def test_admin_review_re_rating_overwrites_status_and_rating(
+    client, admin_token, db
+):
+    """D26 dropped the once-only guard. Re-rating from 5 -> 2 must flip the
+    derived status from approved -> rejected and persist the new rating."""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    # First rating: 5 -> approved
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"rating": 5},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "approved"
+
+    # Re-rate the same row: 2 -> rejected
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={"rating": 2},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert body["review_rating"] == 2
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.status == "rejected"
+    assert row.review_rating == 2
+
+
+def test_admin_review_re_rating_overwrites_tags_and_notes(
+    client, admin_token, db
+):
+    """Re-rating overwrites the prior tags + notes — the new submission is
+    the canonical one. (Important for the migration cohort: pre-D26 tags
+    were preserved; the re-rate flow can replace them.)"""
+    db.add(_pool(external_id="p1"))
+    db.commit()
+    pool_id = db.query(PoolFact).first().id
+
+    # First rating with one set of tags + notes.
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={
+            "rating": 4,
+            "tags": ["concrete-detail"],
+            "notes": "first take",
+        },
+    )
+    assert resp.status_code == 200
+
+    # Re-rate with a different tag set + notes.
+    resp = client.post(
+        f"/admin/review/{pool_id}",
+        headers=_bearer(admin_token),
+        json={
+            "rating": 2,
+            "tags": ["textbooky", "obvious"],
+            "notes": "second take",
+        },
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    row = db.get(PoolFact, pool_id)
+    assert row.review_rating == 2
+    assert row.status == "rejected"
+    assert row.review_tags == ["textbooky", "obvious"]
+    assert row.review_notes == "second take"
 
 
 # --- /admin/push ------------------------------------------------------------

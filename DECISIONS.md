@@ -353,3 +353,21 @@ None of that is built. For v1, retract is best-effort cleanup of a mistake going
 - Sustained launch-pace forever — unsustainable for a Master's student with a day job, risks burnout, and burnout-driven shutdown is the ungraceful kind
 - No wind-down plan — leaves the project to die badly if maintenance lapses, which is bad for users and bad for Will's track record
 
+---
+
+## D26 — 5-point Likert rating as primary review label, status derived
+
+**Decision:** Replace the binary approve/reject action on `POST /admin/review/{pool_id}` with a 1–5 ordinal rating (`review_rating SMALLINT NOT NULL`, CHECK 1–5). The `pool.status` field is no longer set directly by the operator — it derives from rating: `rating >= 4 → 'approved'`, `rating <= 3 → 'rejected'`. Tags (D-implementation 13a) and notes stay as-is.
+
+**Why:** During the 13b rating sprint, Will hit cases where binary forced choice corrupted the calibration signal — "I'll put the explanation why I like it but reject it anyways" and vice versa. Tag-and-note signal disagreed with action signal. The judge in D23 trains on `(features, label)` pairs; with binary labels, a confident-yes and a barely-yes look identical, and contradictory tag/action pairs teach the wrong lesson. A 1–5 ordinal label transmits *strength* of judgment, lets the judge become an ordinal regressor instead of a binary classifier, and makes auto-decision thresholds (e.g. predicted rating ≥ 4.2) statistically meaningful instead of probabilistic guesses. Re-rating allowed (drop the once-only guard) because calibration drift is real and revisiting earlier judgments is part of the process.
+
+**Why 5 points specifically:** 5 is the standard Likert cardinality for ordinal judgments. 3 forces too many decisions through a single "medium" anchor; 7 introduces noise without proportional signal. 5 gives a clear middle (3 = borderline), two confident extremes (1, 5), and two adjacent levels (2, 4) where the operator can express directional lean without forced commitment.
+
+**Why rated, not tag-rated:** Considered per-tag 5-point ratings (4–5 tags × 5 points × 150 facts = 600–750 micro-judgments). Rejected: tag ratings are highly correlated with overall rating, the marginal information is small, and the cognitive load risks pushing all ratings toward the 3-anchor under fatigue. Simpler to capture overall rating well and let the judge learn tag-attribution patterns from the rating + tags combination.
+
+**Threshold (4 vs 3):** Threshold is 4 (rating ≥ 4 → approved). Rating 3 means "borderline / I'm not sure" — pinning that to approved would let lukewarm content reach users; pinning it to rejected discards the operator's hesitation. Treating 3 as rejected is the safer default for a daily-fact app where a published miss costs more than an unpublished hit.
+
+**Existing 39 rated rows (pre-D26):** Re-rate, don't backfill. Mechanical mapping (`approved → 4`, `rejected → 2`) is lossy — the binary labels were already noisy per Will's own observation. Re-rating is ≈10 minutes; backfilling permanently corrupts the calibration set.
+
+**Rejected:** Binary status as primary signal (the cause of the calibration drift). Per-tag rating (cognitive overhead with diminishing returns). 7-point or 10-point scales (more noise than signal). Threshold = 3 (lets borderline reach users).
+

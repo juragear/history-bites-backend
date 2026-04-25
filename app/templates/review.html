@@ -6,7 +6,10 @@
   <meta name="robots" content="noindex,nofollow">
   <title>HistoryBites — review queue</title>
   <style>
-    /* Inline-only styles. Function over form. Should read on a phone. */
+    /* Inline-only styles. Function over form. Should read on a phone.
+       Step 13c (D26): two approve/reject buttons replaced by a 1-5 Likert
+       circle selector. Status derives server-side. Submit is disabled until
+       a rating is picked so we never POST a zero-information form. */
     :root {
       --fg: #1a1a1a;
       --muted: #666;
@@ -20,6 +23,20 @@
       --reject: #b3261e;
       --reject-bg: #fce8e6;
       --reject-pill-bg: #fee2e2;
+      /* Step 13c — color-graded ordinal palette: red -> orange -> gray ->
+         lime -> green. Picked by ordinal position, not approve/reject — the
+         5-circle row reads as a gradient at a glance. Borderline at 3 is
+         the calibration lever (D26 Why threshold=4). */
+      --rating-1: #fee2e2; /* bad */
+      --rating-2: #fed7aa; /* mediocre */
+      --rating-3: #e5e7eb; /* borderline */
+      --rating-4: #d9f99d; /* good */
+      --rating-5: #d1fae5; /* exemplary */
+      --rating-1-fg: #b91c1c;
+      --rating-2-fg: #9a3412;
+      --rating-3-fg: #4b5563;
+      --rating-4-fg: #3f6212;
+      --rating-5-fg: #137333;
     }
     * { box-sizing: border-box; }
     body {
@@ -133,6 +150,87 @@
       color: #9ca3af;
       margin-top: 4px;
     }
+
+    /* Step 13c — 1-5 Likert rating selector ----------------------------- */
+    .rating-section {
+      margin: 12px 0;
+      padding: 12px 0 4px;
+      border-top: 1px dashed var(--border);
+    }
+    .rating-prompt {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .rating-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .rating-circle {
+      flex: 1;
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: white;
+      font: inherit;
+      font-weight: 600;
+      font-size: 16px;
+      cursor: pointer;
+      color: var(--fg);
+      font-family: inherit;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .rating-circle:hover { background: #f3f4f6; }
+    .rating-circle.selected[data-rating="1"] {
+      background: var(--rating-1);
+      border-color: var(--rating-1-fg);
+      color: var(--rating-1-fg);
+    }
+    .rating-circle.selected[data-rating="2"] {
+      background: var(--rating-2);
+      border-color: var(--rating-2-fg);
+      color: var(--rating-2-fg);
+    }
+    .rating-circle.selected[data-rating="3"] {
+      background: var(--rating-3);
+      border-color: var(--rating-3-fg);
+      color: var(--rating-3-fg);
+    }
+    .rating-circle.selected[data-rating="4"] {
+      background: var(--rating-4);
+      border-color: var(--rating-4-fg);
+      color: var(--rating-4-fg);
+    }
+    .rating-circle.selected[data-rating="5"] {
+      background: var(--rating-5);
+      border-color: var(--rating-5-fg);
+      color: var(--rating-5-fg);
+    }
+    .rating-anchors {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .rating-anchors span {
+      flex: 1;
+      text-align: center;
+    }
+    .borderline-cue {
+      margin-top: 8px;
+      padding: 8px 10px;
+      background: #fef3c7;
+      color: #92400e;
+      border-radius: 6px;
+      font-size: 13px;
+    }
     .action-row {
       position: sticky;
       bottom: 0;
@@ -152,17 +250,19 @@
       min-width: 100px;
       min-height: 44px; /* touch target */
     }
-    .btn-approve {
-      background: var(--approve-bg);
-      color: var(--approve);
-      border-color: var(--approve);
+    .btn-submit {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+      flex: 1;
     }
-    .btn-reject {
-      background: var(--reject-bg);
-      color: var(--reject);
-      border-color: var(--reject);
+    .btn-submit:disabled {
+      background: #d1d5db;
+      color: #6b7280;
+      border-color: #d1d5db;
+      cursor: not-allowed;
     }
-    .btn:hover { filter: brightness(0.97); }
+    .btn:not(:disabled):hover { filter: brightness(0.97); }
   </style>
 </head>
 <body>
@@ -196,33 +296,54 @@
         </div>
         <form method="post" action="/admin/review/{{ row.id }}" class="review-form">
           <input type="hidden" name="token" value="{{ admin_token }}">
+          <input type="hidden" name="rating" class="rating-value" value="{{ row.review_rating or '' }}">
 
           <div class="tag-section">
             <div class="tag-group approve-tags">
               <div class="tag-group-label">Approve reasons</div>
-              <button type="button" class="tag-pill" data-tag="surprising-angle">surprising angle</button>
-              <button type="button" class="tag-pill" data-tag="human-scale">human scale</button>
-              <button type="button" class="tag-pill" data-tag="concrete-detail">concrete detail</button>
-              <button type="button" class="tag-pill" data-tag="well-paraphrased">well paraphrased</button>
-              <button type="button" class="tag-pill" data-tag="clear-stakes">clear stakes</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'surprising-angle' in row.review_tags %} selected{% endif %}" data-tag="surprising-angle">surprising angle</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'human-scale' in row.review_tags %} selected{% endif %}" data-tag="human-scale">human scale</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'concrete-detail' in row.review_tags %} selected{% endif %}" data-tag="concrete-detail">concrete detail</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'well-paraphrased' in row.review_tags %} selected{% endif %}" data-tag="well-paraphrased">well paraphrased</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'clear-stakes' in row.review_tags %} selected{% endif %}" data-tag="clear-stakes">clear stakes</button>
             </div>
             <div class="tag-group reject-tags">
               <div class="tag-group-label">Reject reasons</div>
-              <button type="button" class="tag-pill" data-tag="textbooky">textbooky</button>
-              <button type="button" class="tag-pill" data-tag="dates-and-names-only">dates &amp; names only</button>
-              <button type="button" class="tag-pill" data-tag="obvious">obvious</button>
-              <button type="button" class="tag-pill" data-tag="stylistic-tic">stylistic tic</button>
-              <button type="button" class="tag-pill" data-tag="category-mismatch">category mismatch</button>
-              <button type="button" class="tag-pill" data-tag="infobox-flavored">infobox-flavored</button>
-              <button type="button" class="tag-pill" data-tag="boring-even-if-true">boring even if true</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'textbooky' in row.review_tags %} selected{% endif %}" data-tag="textbooky">textbooky</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'dates-and-names-only' in row.review_tags %} selected{% endif %}" data-tag="dates-and-names-only">dates &amp; names only</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'obvious' in row.review_tags %} selected{% endif %}" data-tag="obvious">obvious</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'stylistic-tic' in row.review_tags %} selected{% endif %}" data-tag="stylistic-tic">stylistic tic</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'category-mismatch' in row.review_tags %} selected{% endif %}" data-tag="category-mismatch">category mismatch</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'infobox-flavored' in row.review_tags %} selected{% endif %}" data-tag="infobox-flavored">infobox-flavored</button>
+              <button type="button" class="tag-pill{% if row.review_tags and 'boring-even-if-true' in row.review_tags %} selected{% endif %}" data-tag="boring-even-if-true">boring even if true</button>
             </div>
-            <textarea name="notes" maxlength="500" rows="3" placeholder="Optional notes..."></textarea>
-            <div class="char-counter"><span class="char-count">0</span> / 500</div>
+            <textarea name="notes" maxlength="500" rows="3" placeholder="Optional notes...">{{ row.review_notes or '' }}</textarea>
+            <div class="char-counter"><span class="char-count">{{ (row.review_notes or '') | length }}</span> / 500</div>
+          </div>
+
+          <div class="rating-section">
+            <div class="rating-prompt">Rate this fact (1 = bad, 5 = exemplary)</div>
+            <div class="rating-row">
+              <button type="button" class="rating-circle{% if row.review_rating == 1 %} selected{% endif %}" data-rating="1" aria-label="1 — bad">1</button>
+              <button type="button" class="rating-circle{% if row.review_rating == 2 %} selected{% endif %}" data-rating="2" aria-label="2 — mediocre">2</button>
+              <button type="button" class="rating-circle{% if row.review_rating == 3 %} selected{% endif %}" data-rating="3" aria-label="3 — borderline">3</button>
+              <button type="button" class="rating-circle{% if row.review_rating == 4 %} selected{% endif %}" data-rating="4" aria-label="4 — good">4</button>
+              <button type="button" class="rating-circle{% if row.review_rating == 5 %} selected{% endif %}" data-rating="5" aria-label="5 — exemplary">5</button>
+            </div>
+            <div class="rating-anchors">
+              <span>bad</span>
+              <span>mediocre</span>
+              <span>borderline</span>
+              <span>good</span>
+              <span>exemplary</span>
+            </div>
+            <div class="borderline-cue"{% if row.review_rating != 3 %} hidden{% endif %}>
+              Borderline = rejected. Threshold is 4 (D26): when in doubt, reject is the safer default.
+            </div>
           </div>
 
           <div class="action-row">
-            <button type="submit" name="action" value="approve" class="btn btn-approve">Approve</button>
-            <button type="submit" name="action" value="reject" class="btn btn-reject">Reject</button>
+            <button type="submit" class="btn btn-submit"{% if not row.review_rating %} disabled{% endif %}>Submit rating</button>
           </div>
         </form>
       </div>
@@ -230,9 +351,10 @@
   {% endif %}
 
   <script>
-    // Step 13a — pill toggle, char counter, hidden-input materialization on
-    // submit. Vanilla JS, scoped per form. No framework dependency.
+    // Step 13c — 5-circle rating selector + tag pill toggle + char counter +
+    // hidden-input materialization on submit. Vanilla JS, scoped per form.
     document.querySelectorAll('.review-form').forEach(function (form) {
+      // Tag pill toggle (Step 13a behavior, unchanged).
       form.querySelectorAll('.tag-pill').forEach(function (pill) {
         pill.addEventListener('click', function (e) {
           e.preventDefault();
@@ -240,6 +362,8 @@
         });
       });
 
+      // Notes char counter (Step 13a behavior, unchanged but seeded from the
+      // pre-filled value if any).
       var textarea = form.querySelector('textarea[name="notes"]');
       var counter = form.querySelector('.char-count');
       if (textarea && counter) {
@@ -248,8 +372,33 @@
         });
       }
 
+      // Rating selector. Picking a circle:
+      //   - exclusively selects that circle (others lose .selected)
+      //   - writes the value into the hidden `rating` input the form posts
+      //   - enables the submit button (disabled until first selection)
+      //   - toggles the borderline-warning cue when rating === 3
+      var ratingInput = form.querySelector('input[name="rating"].rating-value');
+      var submitBtn = form.querySelector('.btn-submit');
+      var borderlineCue = form.querySelector('.borderline-cue');
+      var circles = form.querySelectorAll('.rating-circle');
+      circles.forEach(function (circle) {
+        circle.addEventListener('click', function (e) {
+          e.preventDefault();
+          var value = circle.dataset.rating;
+          circles.forEach(function (c) { c.classList.remove('selected'); });
+          circle.classList.add('selected');
+          ratingInput.value = value;
+          submitBtn.disabled = false;
+          if (borderlineCue) {
+            borderlineCue.hidden = (value !== '3');
+          }
+        });
+      });
+
+      // On submit, materialize selected tag pills as hidden `tags` inputs.
+      // Drop any stragglers from a previous submit attempt first so we don't
+      // double-submit the same tag.
       form.addEventListener('submit', function () {
-        // Drop any stale hidden tags from a previous submit attempt.
         form.querySelectorAll('input[type="hidden"][name="tags"]').forEach(function (el) {
           el.remove();
         });

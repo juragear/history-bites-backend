@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Index,
+    SmallInteger,
     Text,
     UniqueConstraint,
     func,
@@ -59,6 +60,14 @@ class PoolFact(Base):
             "status IN ('pending_review', 'approved', 'rejected')",
             name="ck_pool_status",
         ),
+        # Step 13c (D26): rating is the primary review label, status derives.
+        # Nullable so pre-D26 rows (and freshly-generated rows) can exist without
+        # a rating; the migration resets pre-D26 rated rows to pending so they
+        # come back through the review UI.
+        CheckConstraint(
+            "review_rating IS NULL OR (review_rating BETWEEN 1 AND 5)",
+            name="ck_pool_review_rating_range",
+        ),
         Index("idx_pool_status", "status"),
     )
 
@@ -87,6 +96,10 @@ class PoolFact(Base):
     # NULL in the endpoint so "no tags" is one canonical state, not two.
     review_tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Step 13c (D26): primary review label, 1-5 Likert. status derives from it
+    # (>=4 -> approved, <=3 -> rejected). NULL on freshly-generated rows and on
+    # pre-D26 rows that have been reset to pending_review for re-rating.
+    review_rating: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

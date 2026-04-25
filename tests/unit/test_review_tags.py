@@ -1,7 +1,11 @@
-"""Unit tests for app.review_tags.validate_tags.
+"""Unit tests for app.review_tags.
 
-Pure function — no DB, no fixtures, no monkeypatch. Just normalization +
-dedupe + palette validation. Step 13a.
+Pure functions — no DB, no fixtures, no monkeypatch.
+
+Covers:
+  - validate_tags: normalization, dedupe, palette validation (Step 13a).
+  - derive_status_from_rating: 1-5 -> 'approved'/'rejected' threshold, type
+    + range guards (Step 13c / D26).
 """
 from __future__ import annotations
 
@@ -11,7 +15,9 @@ from app.review_tags import (
     ALL_TAGS,
     APPROVE_TAGS,
     REJECT_TAGS,
+    InvalidRatingError,
     InvalidTagError,
+    derive_status_from_rating,
     validate_tags,
 )
 
@@ -57,3 +63,46 @@ def test_palette_partition_is_disjoint():
     listing the same tag twice."""
     assert APPROVE_TAGS.isdisjoint(REJECT_TAGS)
     assert ALL_TAGS == APPROVE_TAGS | REJECT_TAGS
+
+
+# --- derive_status_from_rating (Step 13c / D26) ----------------------------
+
+
+@pytest.mark.parametrize(
+    "rating,expected",
+    [
+        (1, "rejected"),
+        (2, "rejected"),
+        (3, "rejected"),  # borderline -> rejected (D26 threshold = 4)
+        (4, "approved"),
+        (5, "approved"),
+    ],
+)
+def test_derive_status_threshold(rating, expected):
+    """The whole point of D26: threshold is 4, not 3. Borderline rates as
+    rejected because 'I'm not sure' is the safer default for a daily-fact
+    app where a published miss costs more than an unpublished hit."""
+    assert derive_status_from_rating(rating) == expected
+
+
+@pytest.mark.parametrize("rating", [0, 6, -1, 100])
+def test_derive_status_out_of_range_raises(rating):
+    with pytest.raises(InvalidRatingError):
+        derive_status_from_rating(rating)
+
+
+@pytest.mark.parametrize("rating", ["4", 4.0, None])
+def test_derive_status_non_int_raises(rating):
+    """Strings and floats fail loudly. The endpoint coerces digit-strings to
+    int before calling the helper; the helper itself stays strict."""
+    with pytest.raises(InvalidRatingError):
+        derive_status_from_rating(rating)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("rating", [True, False])
+def test_derive_status_bool_raises(rating):
+    """`True == 1` and `False == 0` in Python, and `isinstance(True, int)` is
+    True. Without the explicit `isinstance(x, bool)` guard, derive(True)
+    would silently return 'rejected' (because True < 4). Lock that down."""
+    with pytest.raises(InvalidRatingError):
+        derive_status_from_rating(rating)  # type: ignore[arg-type]

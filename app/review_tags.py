@@ -1,4 +1,5 @@
-"""Tag palette for the review UI. Implementation, not architecture.
+"""Tag palette + rating-to-status derivation for the review UI.
+Implementation, not architecture.
 
 Step 13a: structured commentary on each approve/reject. The palette below is
 hand-curated for v1 review patterns; if a tag turns out to be load-bearing
@@ -6,12 +7,16 @@ later (e.g. the judge in D23 keys off it), revisit then. For now: descriptive
 labels Will picks at review time so calibration data (Step 13/14) has more
 than just a binary verdict to learn from.
 
+Step 13c (D26): rating became the primary review label. `derive_status_from_rating`
+is the single source of truth for the rating -> status mapping. Endpoint imports
+from here; tests import from here. Don't duplicate the threshold elsewhere.
+
 Tags are kebab-case for storage and URL safety. Display labels (with spaces)
 live in templates/review.html, not here — this module is data-only.
 
-Approve/reject categorization is a UI affordance, not a constraint: the
-endpoint accepts any combination (e.g. approve + `stylistic-tic`) because the
-`action` field is the gate, and tags are commentary on top.
+Approve/reject categorization on tags is a UI affordance, not a constraint:
+the endpoint accepts any combination (e.g. rating=5 + `stylistic-tic`) because
+rating is the gate, and tags are commentary on top.
 """
 from __future__ import annotations
 
@@ -45,6 +50,28 @@ ALL_TAGS: frozenset[str] = APPROVE_TAGS | REJECT_TAGS
 
 class InvalidTagError(ValueError):
     """Raised when validate_tags receives a tag not in ALL_TAGS."""
+
+
+class InvalidRatingError(ValueError):
+    """Raised when a rating is outside 1-5 or not an int."""
+
+
+def derive_status_from_rating(rating: int) -> str:
+    """Map a 1-5 ordinal rating to a pool status string (D26).
+
+    >=4 -> 'approved', <=3 -> 'rejected'. Threshold is 4 deliberately:
+    rating=3 means 'borderline / I'm not sure', and treating it as rejected
+    is the safer default for a daily-fact app where a published miss costs
+    more than an unpublished hit. See D26 for the full rationale.
+
+    Raises InvalidRatingError if rating is not an int in [1, 5]. Caller is
+    responsible for catching it and returning a 400; this helper just throws.
+    """
+    if not isinstance(rating, int) or isinstance(rating, bool):
+        raise InvalidRatingError(f"rating must be an int 1-5, got {rating!r}")
+    if not 1 <= rating <= 5:
+        raise InvalidRatingError(f"rating must be 1-5, got {rating}")
+    return "approved" if rating >= 4 else "rejected"
 
 
 def validate_tags(tags: list[str] | None) -> list[str]:
