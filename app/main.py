@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.admin import router as admin_router
 from app.config import settings
 from app.db import SessionLocal, get_db
 from app.models import Fact, PoolFact
@@ -50,6 +51,7 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="HistoryBites backend")
+app.include_router(admin_router)
 
 
 # D21c: date-keyed in-memory cache for /today. Keyed by today's ISO date so a

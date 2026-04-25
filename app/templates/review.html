@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>HistoryBites — review queue</title>
+  <style>
+    /* Inline-only styles. Function over form. Should read on a phone. */
+    :root {
+      --fg: #1a1a1a;
+      --muted: #666;
+      --bg: #fafafa;
+      --card: #fff;
+      --border: #ddd;
+      --accent: #0b5fff;
+      --approve: #137333;
+      --approve-bg: #e6f4ea;
+      --reject: #b3261e;
+      --reject-bg: #fce8e6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      margin: 0;
+      padding: 16px;
+      max-width: 720px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .stats {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .stats strong { color: var(--fg); }
+    .empty {
+      padding: 32px;
+      text-align: center;
+      color: var(--muted);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .row {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .meta {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .meta .pill {
+      background: #eef;
+      color: #225;
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .fact {
+      font-size: 17px;
+      margin: 8px 0 12px;
+      padding: 8px 0;
+      border-top: 1px dashed var(--border);
+      border-bottom: 1px dashed var(--border);
+    }
+    .source { font-size: 13px; margin-bottom: 12px; }
+    .source a { color: var(--accent); }
+    .actions { display: flex; gap: 8px; }
+    .actions form { margin: 0; }
+    button {
+      font: inherit;
+      padding: 10px 16px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      min-width: 100px;
+      min-height: 44px; /* touch target */
+    }
+    button.approve { background: var(--approve-bg); color: var(--approve); border-color: var(--approve); }
+    button.reject  { background: var(--reject-bg);  color: var(--reject);  border-color: var(--reject);  }
+    button:hover { filter: brightness(0.97); }
+  </style>
+</head>
+<body>
+  <h1>Review queue</h1>
+  <div class="stats">
+    <span><strong>{{ pending_count }}</strong> pending</span>
+    <span><strong>{{ approved_count }}</strong> approved</span>
+    <span><strong>{{ rejected_count }}</strong> rejected</span>
+  </div>
+
+  {% if pending_count == 0 %}
+    <div class="empty">
+      Queue is empty. Run <code>POST /admin/generate</code> to add a candidate.
+    </div>
+  {% else %}
+    {% for row in pending %}
+      <div class="row">
+        <div class="meta">
+          <span>#{{ row.id }}</span>
+          {% if row.category %}<span class="pill">{{ row.category }}</span>{% endif %}
+          {% if row.region %}<span class="pill">{{ row.region }}</span>{% endif %}
+          {% if row.era %}<span class="pill">{{ row.era }}</span>{% endif %}
+          <span>{{ row.model_used }}</span>
+          <span>prompt {{ row.prompt_version }}</span>
+          <span>{{ row.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+        </div>
+        <div class="fact">{{ row.fact_text }}</div>
+        <div class="source">
+          Source:
+          <a href="{{ row.source_url }}" target="_blank" rel="noopener noreferrer">{{ row.source_url }}</a>
+        </div>
+        <div class="actions">
+          <form method="post" action="/admin/review/{{ row.id }}">
+            <input type="hidden" name="action" value="approve">
+            <input type="hidden" name="token" value="{{ admin_token }}">
+            <button class="approve" type="submit">Approve</button>
+          </form>
+          <form method="post" action="/admin/review/{{ row.id }}">
+            <input type="hidden" name="action" value="reject">
+            <input type="hidden" name="token" value="{{ admin_token }}">
+            <button class="reject" type="submit">Reject</button>
+          </form>
+        </div>
+      </div>
+    {% endfor %}
+  {% endif %}
+</body>
+</html>

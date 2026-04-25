@@ -26,5 +26,11 @@ class Settings(BaseSettings):
 
     PROMPT_VERSION: str = "v1"
 
+    # Bearer token for /admin/* endpoints + the review HTML page (Step 8).
+    # Required — pydantic-settings will fail loudly on boot if it's missing,
+    # which is what we want: there's no safe default for an admin credential.
+    # Set on Railway via `railway variables --set ADMIN_TOKEN=...`.
+    ADMIN_TOKEN: str
+
 
 settings = Settings()
