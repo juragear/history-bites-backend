@@ -122,15 +122,79 @@ async def fetch_extract(title: str) -> ArticleExtract:
     )
 
 
-# Starter curation. Full 30-50 list lives in Step 13.
-# Format: (wikipedia_category_with_prefix, region, era)
-CATEGORIES: list[tuple[str, str, str]] = [
-    ("Category:History_of_Japan", "East Asia", "pre-modern"),
-    ("Category:History_of_the_Ottoman_Empire", "Middle East", "early modern"),
-    ("Category:Pre-Columbian_cultures", "South America", "pre-Columbian"),
-    ("Category:History_of_science_in_the_Islamic_world", "Middle East", "medieval"),
-    ("Category:History_of_the_Mali_Empire", "West Africa", "medieval"),
-    ("Category:History_of_the_Byzantine_Empire", "Mediterranean", "medieval"),
-    ("Category:History_of_the_Mongol_Empire", "Central Asia", "medieval"),
-    ("Category:Han_dynasty", "East Asia", "ancient"),
-]
+# Curated category set for generation (Step 13b expansion of Step 3 starter).
+#
+# Format: (wikipedia_category_with_prefix, region, era).
+#   - region/era values are tags, used downstream by the variety scorer
+#     (D4 cultural diversity, D21b region/era avoidance in scheduling).
+#   - Each tuple was verified at curation time to have 20+ article-type
+#     members via wikipedia.list_candidates(). Categories that 404 or fall
+#     under the threshold get rejected — guessing is unreliable, the API
+#     check is cheap.
+#   - The grouping comments (# East Asia, etc.) are scan aids only; only
+#     the tuple values are load-bearing.
+#
+# Adding a new entry: probe with list_candidates() first. Aim for under-
+# represented (region, era) cells before adding more entries to a cell that
+# already has coverage. Don't recurse into subcategories — cmtype=page in
+# list_candidates already filters those out.
+CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    # East Asia
+    ("Category:Han_dynasty",                          "East Asia",          "ancient"),
+    ("Category:Tang_dynasty",                         "East Asia",          "medieval"),
+    ("Category:Heian_period",                         "East Asia",          "medieval"),
+    ("Category:Ming_dynasty",                         "East Asia",          "early-modern"),
+    ("Category:Sengoku_period",                       "East Asia",          "early-modern"),
+    ("Category:Meiji_era",                            "East Asia",          "modern"),
+    # South Asia
+    ("Category:Maurya_Empire",                        "South Asia",         "ancient"),
+    ("Category:Chola_dynasty",                        "South Asia",         "medieval"),
+    ("Category:Mughal_Empire",                        "South Asia",         "early-modern"),
+    ("Category:Indian_independence_movement",         "South Asia",         "modern"),
+    # Middle East
+    ("Category:Achaemenid_Empire",                    "Middle East",        "ancient"),
+    ("Category:Sasanian_Empire",                      "Middle East",        "classical"),
+    ("Category:Islamic_Golden_Age",                   "Middle East",        "medieval"),
+    ("Category:Ottoman_Empire",                       "Middle East",        "early-modern"),
+    # North Africa
+    ("Category:Ancient_Egypt",                        "North Africa",       "ancient"),
+    ("Category:Carthage",                             "North Africa",       "ancient"),
+    ("Category:Ptolemaic_Kingdom",                    "North Africa",       "classical"),
+    # Sub-Saharan Africa
+    ("Category:Kingdom_of_Kush",                      "Sub-Saharan Africa", "ancient"),
+    ("Category:Mali_Empire",                          "Sub-Saharan Africa", "medieval"),
+    ("Category:Kingdom_of_Kongo",                     "Sub-Saharan Africa", "early-modern"),
+    # Mediterranean
+    ("Category:Ancient_Greece",                       "Mediterranean",      "ancient"),
+    ("Category:Roman_Republic",                       "Mediterranean",      "ancient"),
+    ("Category:Roman_Empire",                         "Mediterranean",      "classical"),
+    ("Category:Crusades",                             "Mediterranean",      "medieval"),
+    ("Category:Renaissance",                          "Mediterranean",      "early-modern"),
+    # Northern Europe
+    ("Category:Hanseatic_League",                     "Northern Europe",    "medieval"),
+    ("Category:Tsardom_of_Russia",                    "Northern Europe",    "early-modern"),
+    # Mesoamerica / South America (pre-Columbian)
+    ("Category:Mesoamerican_cultures",                "Mesoamerica",        "pre-Columbian"),
+    ("Category:Mississippian_culture",                "North America",      "pre-Columbian"),
+    ("Category:Inca_Empire",                          "South America",      "pre-Columbian"),
+    # Americas (colonial / modern)
+    ("Category:Spanish_colonization_of_the_Americas", "Mesoamerica",        "early-modern"),
+    ("Category:Colonial_United_States_(British)",     "North America",      "early-modern"),
+    ("Category:American_Civil_War",                   "North America",      "modern"),
+    # Oceania
+    ("Category:Polynesian_navigation",                "Oceania",            "medieval"),
+    ("Category:M\u0101ori_history",                   "Oceania",            "medieval"),
+    ("Category:History_of_Australia",                 "Oceania",            "modern"),
+    # Central Asia
+    ("Category:Xiongnu",                              "Central Asia",       "ancient"),
+    ("Category:Mongol_Empire",                        "Central Asia",       "medieval"),
+    ("Category:Silk_Road",                            "Central Asia",       "medieval"),
+    # Cross-regional themes (per Step 13b: lean toward "surprising-angle"
+    # material that's not just battles and dynasties)
+    ("Category:Ancient_astronomy",                    "Cross-regional",     "ancient"),
+    ("Category:History_of_cartography",               "Cross-regional",     "early-modern"),
+    ("Category:History_of_navigation",                "Cross-regional",     "early-modern"),
+    ("Category:History_of_mathematics",               "Cross-regional",     "modern"),
+    ("Category:History_of_medicine",                  "Cross-regional",     "modern"),
+    ("Category:History_of_science",                   "Cross-regional",     "modern"),
+)
