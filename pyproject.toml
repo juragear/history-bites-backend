@@ -19,9 +19,31 @@ dependencies = [
     "firebase-admin",
 ]
 
+[project.optional-dependencies]
+# Step 11 test suite. httpx is already a runtime dep but listed here too so
+# `pip install -e .[dev]` is a self-contained "I want to run tests" install.
+# pytest-asyncio is needed because run_generation is async — tests that exercise
+# the topup loop need @pytest.mark.asyncio.
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+# asyncio_mode = "auto" so async test functions don't each need the
+# @pytest.mark.asyncio decorator. generate_one_pool_fact / run_generation are
+# async, and tests that exercise them are the majority of the suite.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    # firebase_admin / pydantic-settings deprecation noise that we don't own.
+    "ignore::DeprecationWarning",
+]
