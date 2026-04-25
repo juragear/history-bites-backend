@@ -43,5 +43,16 @@ class Settings(BaseSettings):
     FCM_TOPIC: str = "daily-fact"
     ALERT_WEBHOOK_URL: str | None = None
 
+    # Step 10 cron thresholds.
+    # REVIEW_QUEUE_TARGET (Backend Architecture): how many pending_review rows
+    # the every-6h generation cron tops up to. Below this, run_generation calls
+    # generate_one_pool_fact in a loop until target is met or generation gives
+    # up. 20 keeps Will with a meaningful queue but caps Gemini spend.
+    # APPROVED_ALERT_THRESHOLD (D8): if approved pool count drops below this
+    # at the end of a generation cron, send_alert fires so Will knows to review
+    # more. 3 = roughly one push-day of buffer.
+    REVIEW_QUEUE_TARGET: int = 20
+    APPROVED_ALERT_THRESHOLD: int = 3
+
 
 settings = Settings()

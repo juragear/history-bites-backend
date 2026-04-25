@@ -149,6 +149,25 @@ class PushResponse(BaseModel):
     pushed_at: datetime | None
 
 
+class RunGenerationResponse(BaseModel):
+    """Mirror of cron.run_generation's summary dict.
+
+    Loose typing on `scheduled` and `alerts_sent` because the cron summary
+    intentionally varies (None, "already_scheduled_or_race", or a fact dict).
+    Pydantic v2 with arbitrary types disabled would still accept dict[str,
+    Any]-style fields via this model — keeps the wire shape honest.
+    """
+
+    started_at: str
+    finished_at: str
+    scheduled: dict | str | None
+    generated: int
+    generation_failures: int
+    pending_after: int
+    approved_after: int
+    alerts_sent: list[str]
+
+
 # --- POST /admin/generate ----------------------------------------------------
 
 
@@ -499,6 +518,41 @@ def admin_push(
             else None
         ),
     )
+
+
+# --- POST /admin/cron/run-generation -----------------------------------------
+
+
+@router.post("/cron/run-generation", response_model=RunGenerationResponse)
+async def admin_run_generation(
+    db: Annotated[Session, Depends(get_db)],
+) -> RunGenerationResponse:
+    """Manually trigger the every-6h generation cron.
+
+    Same job that Railway's [[cron]] entry runs via `python -m app.cron
+    run_generation`. Useful for:
+      - Smoke testing generation + scheduling without waiting up to 6h.
+      - Recovering from a failed cron run by re-driving locally.
+      - Pre-launch pool warming (Will hits this until approved >= some buffer).
+
+    Returns the same structured summary the CLI logs. 503 only if the run
+    raises something it didn't catch — NoApprovedPool / GenerationFailed /
+    alert webhook failures are all handled inside run_generation and surfaced
+    in the response body, not as HTTP errors.
+    """
+    try:
+        summary = await cron.run_generation(db)
+    except Exception as exc:
+        logger.exception(
+            "admin run_generation crashed",
+            extra={"extra": {"error": repr(exc)}},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"run_generation failed: {exc}",
+        ) from exc
+
+    return RunGenerationResponse(**summary)
 
 
 # --- GET /admin/review -------------------------------------------------------
