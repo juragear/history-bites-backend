@@ -101,13 +101,61 @@ Article extract:
 """
 
 
-# Registry of known prompt versions. v2 is deliberately absent (see comment
-# above). Add new versions here as they're built; get_active_prompt() resolves
-# the active one by name and raises ValueError on unknown version so a stale
-# Railway env var fails loudly rather than silently rolling back to v1.
+# V4_PROMPT (Step 13f). Targets the four bottom-5 v3 failure clusters Will
+# surfaced in the v3 calibration round. v3 hit 50% approve (Criterion 1: PASS)
+# but the bottom-5 (rating=2) v3 facts shared four distinct execution issues:
+#   1. Vague trailing endings ("survived well into the Roman era" — closing
+#      clause that gestures at continuation instead of landing a consequence).
+#   2. First/second-half pivot (sentence 2 arrives at an unrelated claim).
+#   3. Overreach (article said "contributed to", fact escalated to "shattered").
+#   4. "Among other things" — incomplete framing that signals laziness.
+# Two new rules added vs V3_PROMPT (Rule 5 close-cleanly, Rule 6
+# stay-within-source). All other rules preserved verbatim from V3 — the
+# upstream rules were working; this round is execution polish, not structure
+# rewrite. Sample size for v4 calibration is intentionally smaller (n=30) per
+# agreement: this is the last prompt iteration; if v4 isn't a clear
+# qualitative win on the bottom-5 patterns, ship v3 and move to Step 14.
+V4_PROMPT = """You are crafting a single fact for a daily history app aimed at a smart but non-specialist English-speaking reader.
+
+You will be given a Wikipedia article extract. Your task is to surface the single most interesting thing in the article and state it in your own words.
+
+Rules:
+1. Find the most interesting thing in the article — the angle a reader would tell a friend about. The thing that makes someone go "huh, really?" History-adjacent angles are welcome and often best: etymology, the origin of a word or place name, how a technique was discovered, why a place got its current borders, the surprising provenance of an everyday object, a forgotten cultural exchange. Not the most prominent fact, not the formal definition, not the date of founding.
+
+2. Land the so-what. The reader should finish the fact understanding why this matters — what it changed, who was affected, what the consequence was.
+
+3. The so-what must be a SEPARATE fact from the headline. If you find yourself writing "X did Y, reflecting/showing/demonstrating Y" or "the name means Z, reflecting the desire for Z" — start over. The consequence must be something the reader couldn't have inferred from the headline alone. Tautologies are forbidden.
+
+4. Lead with the surprising thing. If the article contains a shocking detail (a city was destroyed, a scholar was executed, a rebellion was led by an unexpected figure), that detail should be what the sentence is ABOUT — not a dependent clause attached to a more boring main clause.
+
+5. Close cleanly. The closing clause must add a specific stake, named consequence, or concrete detail — not a vague continuation. Forbidden endings: "survived well into...", "continued to influence...", "shaped X for centuries", "remains an important part of...", "among other things...", "and various other...". If you use a second sentence, it must directly pay off, ground, or complete the first — not pivot to an unrelated detail. If you can't end specifically, write a shorter fact.
+
+6. Stay within the source. If the article says X "contributed to" Y or "was associated with" Y, don't escalate to "directly caused" or "shattered" or "transformed". Match the article's level of certainty. Don't speculate beyond what the source supports.
+
+7. Assume the reader is unfamiliar with the topic. Briefly ground anything niche — a place, a title, a people, a regnal name — so the fact lands without requiring outside knowledge. One short clause is enough.
+
+8. State the fact in your own words. Do not copy phrasing from the source.
+
+9. 1-2 sentences. The first sentence states the fact. A second sentence is allowed only when it lands the consequence, the timeline, or the context that the first sentence couldn't carry. Do NOT add a second sentence as filler. Aim for 200-350 characters total. Hard cap at 400.
+
+10. No filler intensifiers ("incredibly", "astonishingly", "remarkably", "fascinatingly", "surprisingly") and no lecturing tone. Let the fact be surprising on its own.
+
+Return JSON with a single field "fact" containing the sentence(s) and nothing else.
+
+Article extract:
+{extract}
+"""
+
+
+# Registry of known prompt versions. v2 is deliberately absent (see V2 comment
+# above). v4 added Step 13f. Add new versions here as they're built;
+# get_active_prompt() resolves the active one by name and raises ValueError on
+# unknown version so a stale Railway env var fails loudly rather than silently
+# rolling back to v1.
 _PROMPTS: dict[str, str] = {
     "v1": V1_PROMPT,
     "v3": V3_PROMPT,
+    "v4": V4_PROMPT,
 }
 
 

@@ -1,10 +1,11 @@
 """Unit tests for app.model_provider — prompt version selector.
 
 Step 13e: V2 was removed from the registry (the v2 batch was contaminated;
-see the comment in app/model_provider.py for details). The selector now
-resolves v1 + v3 only, and explicitly rejects v2 — pointing PROMPT_VERSION=v2
-at the new model+source+filter would silently produce v3-quality output
-under a "v2" label, which would corrupt downstream comparisons.
+see the comment in app/model_provider.py for details). Step 13f: V4 added
+to address the v3 bottom-5 failure modes. The selector now resolves
+v1 + v3 + v4 and explicitly rejects v2 — pointing PROMPT_VERSION=v2 at the
+current model+source+filter would silently produce v3-quality output under
+a "v2" label, which would corrupt downstream comparisons.
 
 Why these tests matter: without a loud ValueError on unknown / dropped
 versions, a stale Railway env var would fall through to whatever default
@@ -18,6 +19,7 @@ import pytest
 from app.model_provider import (
     V1_PROMPT,
     V3_PROMPT,
+    V4_PROMPT,
     get_active_prompt,
 )
 
@@ -30,6 +32,13 @@ def test_get_active_prompt_returns_v3_for_v3():
     assert get_active_prompt("v3") is V3_PROMPT
 
 
+def test_get_active_prompt_returns_v4_for_v4():
+    """Step 13f: V4_PROMPT adds two new rules to V3 (close cleanly,
+    stay within source) targeting the v3 bottom-5 failure modes.
+    """
+    assert get_active_prompt("v4") is V4_PROMPT
+
+
 def test_get_active_prompt_rejects_dropped_v2():
     """v2 is deliberately absent from the registry. Pointing
     PROMPT_VERSION=v2 at the new model+source+filter would produce
@@ -39,7 +48,7 @@ def test_get_active_prompt_rejects_dropped_v2():
         get_active_prompt("v2")
     msg = str(exc_info.value)
     assert "v2" in msg
-    assert "v1" in msg and "v3" in msg
+    assert "v1" in msg and "v3" in msg and "v4" in msg
 
 
 def test_get_active_prompt_unknown_version_raises():
@@ -47,4 +56,4 @@ def test_get_active_prompt_unknown_version_raises():
         get_active_prompt("v99")
     msg = str(exc_info.value)
     assert "v99" in msg
-    assert "v1" in msg and "v3" in msg
+    assert "v1" in msg and "v3" in msg and "v4" in msg
