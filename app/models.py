@@ -55,7 +55,19 @@ class Fact(Base):
 class PoolFact(Base):
     __tablename__ = "pool"
     __table_args__ = (
-        UniqueConstraint("source_name", "external_id", name="uq_pool_source_external"),
+        # D27 (Step 13d): uniqueness widened to include prompt_version so the
+        # same Wikipedia article can have one row per prompt version. Required
+        # for v1/v2 A/B regeneration on the same external_ids — without
+        # prompt_version in the key, the v2 inserts hit the v1 row's unique
+        # constraint and fail. Generation pipeline still uses topic-level
+        # dedup (D3) via get_used_external_ids; the constraint is the safety
+        # net for races, not the dedup mechanism.
+        UniqueConstraint(
+            "source_name",
+            "external_id",
+            "prompt_version",
+            name="uq_pool_source_external_prompt",
+        ),
         CheckConstraint(
             "status IN ('pending_review', 'approved', 'rejected')",
             name="ck_pool_status",

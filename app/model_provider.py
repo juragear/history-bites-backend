@@ -12,7 +12,7 @@ They just return whatever the model said in the `{"fact": "..."}` JSON shape.
 from __future__ import annotations
 
 import json
-from typing import Protocol
+from typing import Optional, Protocol
 
 import httpx
 from google import genai
@@ -23,6 +23,11 @@ from app.config import settings
 
 # Exact v1 prompt from Backend Architecture. The {extract} placeholder is the
 # only interpolation point — anything else in the prompt is fixed.
+#
+# DO NOT MODIFY V1_PROMPT. It's the calibration baseline for every prompt A/B
+# (Sessions 13b/d/e). Editing it would invalidate every comparison that's
+# been done against rated v1 data. New iterations live as new constants
+# (V3_PROMPT, V4_PROMPT, ...) and are activated via PROMPT_VERSION.
 V1_PROMPT = """You are generating a single fact for a daily history notification app.
 
 Source article:
@@ -36,6 +41,92 @@ fact directly as if you are a knowledgeable friend mentioning it.
 Respond with JSON only: {{"fact": "your sentence here"}}"""
 
 
+# Step 13e: V2_PROMPT removed.
+#
+# The v2 designation is contaminated. v2 ran on Gemini 2.5 Flash + REST-only
+# extracts (~800 chars) + a non-functional pre-filter. Will's review of the
+# resulting batch surfaced six specific failure clusters (meta articles
+# slipping through, stub articles producing stub facts, tautological so-whats,
+# wrong angles even with explicit rules, list-article repeats, buried ledes)
+# that v3 fixes by changing both the model AND the source AND the filter AND
+# the prompt simultaneously. Keeping v2 in the registry would invite anyone
+# pointing PROMPT_VERSION=v2 at the new model+source+filter and producing
+# results that aren't comparable to the (deleted) v2 batch OR to v3.
+#
+# v2 facts in pool were deleted in migration `0b3a8f2e1c4d`. The historical
+# V2_PROMPT text is preserved verbatim in the Session 13d Claude Code Log
+# entry and in the Decisions Log discussion of D27.
+
+
+# V3_PROMPT (Step 13e). Fixes six failure clusters surfaced by Will's review
+# of the v2 batch:
+#   1. Tautological so-whats — Rule 3 forbids "X did Y, reflecting Y" loops.
+#   2. Wrong angle even with explicit rules — Rule 1 names the "huh, really?"
+#      target explicitly and lists adjacent angles (etymology, provenance,
+#      forgotten cultural exchange) that v2 missed.
+#   3. Buried lede — Rule 4 mandates leading with the surprising thing as the
+#      MAIN clause, not a dependent clause.
+#   4. Filler intensifiers — Rule 8 expanded to include "fascinatingly",
+#      "surprisingly".
+#   5. Higher char ceiling — Rule 7 raised to 200-350 typical, hard cap 400
+#      (was 100-250 / 280 in v2). Two-sentence facts need room.
+#   6. Stub/list/meta articles — handled by the pre-filter (title regex +
+#      MIN_EXTRACT_CHARS + _looks_infoboxy in app/wikipedia.py and
+#      app/generation.py), not by the prompt.
+V3_PROMPT = """You are crafting a single fact for a daily history app aimed at a smart but non-specialist English-speaking reader.
+
+You will be given a Wikipedia article extract. Your task is to surface the single most interesting thing in the article and state it in your own words.
+
+Rules:
+1. Find the most interesting thing in the article — the angle a reader would tell a friend about. The thing that makes someone go "huh, really?" History-adjacent angles are welcome and often best: etymology, the origin of a word or place name, how a technique was discovered, why a place got its current borders, the surprising provenance of an everyday object, a forgotten cultural exchange. Not the most prominent fact, not the formal definition, not the date of founding.
+
+2. Land the so-what. The reader should finish the fact understanding why this matters — what it changed, who was affected, what the consequence was.
+
+3. The so-what must be a SEPARATE fact from the headline. If you find yourself writing "X did Y, reflecting/showing/demonstrating Y" or "the name means Z, reflecting the desire for Z" — start over. The consequence must be something the reader couldn't have inferred from the headline alone. Tautologies are forbidden.
+
+4. Lead with the surprising thing. If the article contains a shocking detail (a city was destroyed, a princess was 12, a scholar was executed, a rebellion was led by an unexpected figure), that detail should be what the sentence is ABOUT — not a dependent clause attached to a more boring main clause. If you write "After the city was destroyed in 1702, this house was built" — restructure so "the city was destroyed in 1702" is the fact.
+
+5. Assume the reader is unfamiliar with the topic. Briefly ground anything niche — a place, a title, a people, a regnal name — so the fact lands without requiring outside knowledge. One short clause is enough.
+
+6. State the fact in your own words. Do not copy phrasing from the source.
+
+7. 1-2 sentences. The first sentence states the fact. A second sentence is allowed only when it lands the consequence, the timeline, or the context that the first sentence couldn't carry. Do NOT add a second sentence as filler. Aim for 200-350 characters total. Hard cap at 400.
+
+8. No filler intensifiers ("incredibly", "astonishingly", "remarkably", "fascinatingly", "surprisingly") and no lecturing tone. Let the fact be surprising on its own.
+
+Return JSON with a single field "fact" containing the sentence(s) and nothing else.
+
+Article extract:
+{extract}
+"""
+
+
+# Registry of known prompt versions. v2 is deliberately absent (see comment
+# above). Add new versions here as they're built; get_active_prompt() resolves
+# the active one by name and raises ValueError on unknown version so a stale
+# Railway env var fails loudly rather than silently rolling back to v1.
+_PROMPTS: dict[str, str] = {
+    "v1": V1_PROMPT,
+    "v3": V3_PROMPT,
+}
+
+
+def get_active_prompt(version: str | None = None) -> str:
+    """Resolve the active prompt template by version string.
+
+    Defaults to settings.PROMPT_VERSION when version is None. Raises
+    ValueError on unknown version so misconfigurations fail loudly at the
+    first generation call rather than silently emitting v1 output under a
+    different label.
+    """
+    v = version if version is not None else settings.PROMPT_VERSION
+    if v not in _PROMPTS:
+        raise ValueError(
+            f"Unknown PROMPT_VERSION={v!r}. Known: {sorted(_PROMPTS)}"
+        )
+    return _PROMPTS[v]
+
+
 class ModelProviderError(Exception):
     """Raised when the model call fails, returns malformed JSON, or empty output.
 
@@ -45,7 +136,18 @@ class ModelProviderError(Exception):
 
 
 class ModelProvider(Protocol):
-    async def extract_fact(self, article_extract: str) -> str: ...
+    async def extract_fact(
+        self, article_extract: str, *, version: Optional[str] = None
+    ) -> str:
+        """Generate a fact from a Wikipedia article extract.
+
+        Step 13e: optional `version` overrides the active prompt selection.
+        Defaults to None which falls through to settings.PROMPT_VERSION via
+        get_active_prompt(). The override path is for ops scripts (e.g.
+        regenerate_with_v3.py) that force a non-default prompt without
+        mutating the global settings object.
+        """
+        ...
 
 
 def _parse_fact_json(raw: str, *, provider: str, model: str) -> str:
@@ -68,8 +170,10 @@ class GeminiProvider:
         self._client = genai.Client(api_key=api_key)
         self._model = model
 
-    async def extract_fact(self, article_extract: str) -> str:
-        prompt = V1_PROMPT.format(extract=article_extract)
+    async def extract_fact(
+        self, article_extract: str, *, version: Optional[str] = None
+    ) -> str:
+        prompt = get_active_prompt(version).format(extract=article_extract)
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema={
@@ -102,8 +206,10 @@ class OllamaProvider:
         self._base_url = base_url.rstrip("/")
         self._model = model
 
-    async def extract_fact(self, article_extract: str) -> str:
-        prompt = V1_PROMPT.format(extract=article_extract)
+    async def extract_fact(
+        self, article_extract: str, *, version: Optional[str] = None
+    ) -> str:
+        prompt = get_active_prompt(version).format(extract=article_extract)
         payload = {
             "model": self._model,
             "prompt": prompt,

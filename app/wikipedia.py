@@ -3,14 +3,22 @@
 Two operations, both against English Wikipedia:
   1. list_candidates(category) — list articles in a category via the action API's
      `categorymembers` endpoint (D10). `cmtype=page` filters out sub-categories
-     and file entries; we only want article pages.
-  2. fetch_extract(title) — fetch the REST API summary for one article. The
-     returned `extract` becomes the source material we hand to Gemini later.
+     and file entries; we only want article pages. Step 13e: title regex
+     pre-filter rejects List/Timeline/Society-of/Election articles before they
+     reach the model — these dominated the v1/v2 boring cohort.
+  2. fetch_extract(title) — Step 13e: switched from REST `/page/summary/`
+     (~800 char lead only) to the action API `prop=extracts` endpoint (full
+     plaintext article). Result is section-aware truncated to ≤15k chars,
+     dropping References/See also entirely and prioritizing
+     History/Background/Notable/Significance sections. The fuller extract
+     gives the model enough material to find the consequential angle rather
+     than the most prominent one.
 
 Both share a single httpx.AsyncClient (10s timeout, User-Agent from settings)
 and are wrapped in tenacity retry that backs off on transient failures (network
 errors, 5xx) but fails fast on 4xx (e.g. 404 — the article just doesn't exist).
 """
+import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -26,7 +34,6 @@ from app.config import settings
 
 
 ACTION_API_URL = "https://en.wikipedia.org/w/api.php"
-REST_API_BASE = "https://en.wikipedia.org/api/rest_v1"
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,23 @@ class ArticleExtract:
     source_url: str
 
 
+class WikipediaError(Exception):
+    """Generic Wikipedia client error (non-HTTP)."""
+
+
+class WikipediaNotFound(WikipediaError):
+    """Article missing from Wikipedia (action API returned `missing` flag).
+
+    Distinct from httpx 4xx — the action API returns 200 with a `missing`
+    marker for non-existent titles instead of 404. Callers treat this as a
+    skip (same semantics as the old 4xx path).
+    """
+
+    def __init__(self, title: str) -> None:
+        super().__init__(f"Wikipedia article not found: {title!r}")
+        self.title = title
+
+
 _client: httpx.AsyncClient | None = None
 
 
@@ -50,7 +74,7 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(
-            timeout=10.0,
+            timeout=15.0,
             headers={"User-Agent": settings.WIKIPEDIA_USER_AGENT},
         )
     return _client
@@ -83,11 +107,114 @@ async def _get_json(url: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+# --- Title pre-filter (Step 13e) -------------------------------------------
+#
+# Rejects category members whose title shape correlates with low-quality fact
+# generation. v1/v2 calibration showed three repeating failure clusters:
+#
+#   1. List/Timeline articles — "List of strikes in Australia",
+#      "Timeline of Maori battles". Reference content, not narrative.
+#   2. Meta-organizational articles — "Canadian Society for History and
+#      Philosophy of Mathematics", "Journal of X". The article is *about* the
+#      society/journal, not about history.
+#   3. Election articles — "1924 Victorian state election". Three near-
+#      identical Victoria election facts shipped from v1/v2 because the
+#      Wikipedia infobox shape produces the same fact every time.
+#
+# Apply at list_candidates time, BEFORE the model is called — saves the API
+# spend and keeps the candidate pool focused on narrative content.
+_REJECTED_TITLE_PATTERNS = re.compile(
+    # Reference/list articles
+    r"^(List of |Lists of |Timeline of |Outline of |Index of |Glossary of )"
+    r"|"
+    # Meta-history articles about terms/concepts/definitions
+    r"^(History of (the term|the concept|the word|the phrase)|Definition of |Etymology of )"
+    r"|"
+    # Organizational meta-history (Society for the Study of X, Institute for
+    # the Promotion of Y, etc.). The shape captures most academic-society
+    # patterns without false-positive on real subject articles.
+    r"\b(Society|Association|Institute|Foundation|Academy|Council|Committee|Federation|Union) "
+    r"(for|of) (the )?(Study|History|Philosophy|Research|Promotion|Advancement|Development|Preservation) "
+    r"(of |for )?\b"
+    r"|"
+    # Academic journal/publication wrappers
+    r"^(Journal of |Bulletin of |Proceedings of )"
+    r"|"
+    # Election articles (extremely repetitive — produced 3 near-identical
+    # Victoria election facts and 3 near-identical Roman consul facts)
+    r"\b\d{4} .* (election|by-election|referendum)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_rejected_title(title: str) -> bool:
+    return bool(_REJECTED_TITLE_PATTERNS.search(title))
+
+
+# --- Section-aware truncation (Step 13e) -----------------------------------
+#
+# Action API extracts return plain text with section headers like
+#   "== History ==\n..."
+# Split on those, drop References/See also, prioritize narrative sections.
+_SECTION_BOUNDARY = re.compile(r"\n(?=={2,}\s)")
+_PRIORITY_SECTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"^={2,}\s*(History|Background|Origins?|Founding|Etymology)\s*={2,}",
+        re.I | re.M,
+    ),
+    re.compile(
+        r"^={2,}\s*(Notable|Significance|Legacy|Aftermath|Impact)\s*={2,}",
+        re.I | re.M,
+    ),
+    re.compile(
+        r"^={2,}\s*(Description|Overview|Account|Narrative)\s*={2,}",
+        re.I | re.M,
+    ),
+]
+_REJECTED_SECTION_PATTERNS = re.compile(
+    r"^={2,}\s*(See also|References|External links|Bibliography|Notes|Citations|Further reading|Sources)\s*={2,}",
+    re.I | re.M,
+)
+_MAX_EXTRACT_CHARS = 15_000
+_MAX_SECTIONS = 8
+
+
+def _section_score(s: str) -> int:
+    for i, pattern in enumerate(_PRIORITY_SECTION_PATTERNS):
+        if pattern.match(s):
+            return i
+    # Everything else (no priority match) sorts to lowest priority but still
+    # makes it into the candidate set if there's room.
+    return len(_PRIORITY_SECTION_PATTERNS)
+
+
+def _select_sections(raw_extract: str) -> str:
+    """Pure helper: split action-API plaintext into sections, drop reference
+    sections, sort by narrative priority, return ≤_MAX_EXTRACT_CHARS string.
+
+    Lead (sections[0], no header) is always included first. Body sections are
+    filtered, sorted by priority, capped at _MAX_SECTIONS - 1, then joined.
+    """
+    sections = _SECTION_BOUNDARY.split(raw_extract)
+    if not sections:
+        return ""
+    lead, body = sections[0], sections[1:]
+    body = [s for s in body if not _REJECTED_SECTION_PATTERNS.match(s)]
+    body.sort(key=_section_score)
+    selected = [lead] + body[: _MAX_SECTIONS - 1]
+    truncated = "\n\n".join(selected)
+    if len(truncated) > _MAX_EXTRACT_CHARS:
+        truncated = truncated[:_MAX_EXTRACT_CHARS]
+    return truncated
+
+
 async def list_candidates(category: str) -> list[Candidate]:
     """Return article-page members of a Wikipedia category.
 
     `category` must include the `Category:` prefix and use underscores for
-    spaces, e.g. `"Category:History_of_Japan"`.
+    spaces, e.g. `"Category:History_of_Japan"`. Step 13e: titles matching
+    `_REJECTED_TITLE_PATTERNS` (List/Timeline/Society-of/Election/...) are
+    filtered out here so they never reach the model.
     """
     params = {
         "action": "query",
@@ -99,26 +226,60 @@ async def list_candidates(category: str) -> list[Candidate]:
     }
     data = await _get_json(ACTION_API_URL, params=params)
     members = data.get("query", {}).get("categorymembers", [])
-    return [Candidate(page_id=m["pageid"], title=m["title"]) for m in members]
+    return [
+        Candidate(page_id=m["pageid"], title=m["title"])
+        for m in members
+        if not _is_rejected_title(m["title"])
+    ]
 
 
 async def fetch_extract(title: str) -> ArticleExtract:
-    """Fetch the REST API summary for a single article title.
+    """Fetch full article extract via action API, section-aware truncated.
 
-    Returns the `extract` field (lede paragraphs as plain text) plus the
-    canonical desktop URL for attribution.
+    Step 13e: switched from REST `/page/summary/` (lead paragraphs only,
+    ~800 chars) to action API `prop=extracts&explaintext=1` (full article
+    plain text). The fuller body lets the model find the consequential angle
+    rather than the most prominent fact in the lead.
+
+    Truncation strategy (`_select_sections`):
+      1. Always include the lead (sections[0]).
+      2. Drop See also / References / External links / Bibliography / Notes
+         / Citations / Further reading / Sources entirely.
+      3. Sort remaining sections by narrative priority:
+         History/Background/Origins/Founding/Etymology > Notable/Significance/
+         Legacy/Aftermath/Impact > Description/Overview/Account/Narrative >
+         everything else.
+      4. Cap at 8 sections OR 15k chars, whichever hits first.
+
+    Raises:
+      WikipediaNotFound — action API returned the `missing` marker.
+      httpx.HTTPStatusError — non-2xx HTTP response (5xx retried by tenacity,
+        4xx propagated for the caller's existing skip path).
     """
-    url = f"{REST_API_BASE}/page/summary/{quote(title, safe='')}"
-    data = await _get_json(url)
-    source_url = (
-        data.get("content_urls", {}).get("desktop", {}).get("page")
-        or f"https://en.wikipedia.org/wiki/{quote(title, safe='')}"
-    )
+    params = {
+        "action": "query",
+        "prop": "extracts",
+        "exintro": 0,
+        "explaintext": 1,
+        "redirects": 1,
+        "format": "json",
+        "titles": title,
+    }
+    data = await _get_json(ACTION_API_URL, params=params)
+    pages = data.get("query", {}).get("pages", {})
+    if not pages:
+        raise WikipediaError(f"action API returned no pages for title={title!r}")
+    page = next(iter(pages.values()))
+    if "missing" in page:
+        raise WikipediaNotFound(title)
+    raw_extract = page.get("extract", "") or ""
+    truncated = _select_sections(raw_extract)
+    canonical_title = page.get("title", title)
     return ArticleExtract(
-        page_id=data["pageid"],
-        title=data["title"],
-        extract=data.get("extract", ""),
-        source_url=source_url,
+        page_id=page["pageid"],
+        title=canonical_title,
+        extract=truncated,
+        source_url=f"https://en.wikipedia.org/wiki/{quote(canonical_title.replace(' ', '_'), safe='_/()')}",
     )
 
 
@@ -183,7 +344,7 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("Category:American_Civil_War",                   "North America",      "modern"),
     # Oceania
     ("Category:Polynesian_navigation",                "Oceania",            "medieval"),
-    ("Category:M\u0101ori_history",                   "Oceania",            "medieval"),
+    ("Category:Māori_history",                   "Oceania",            "medieval"),
     ("Category:History_of_Australia",                 "Oceania",            "modern"),
     # Central Asia
     ("Category:Xiongnu",                              "Central Asia",       "ancient"),

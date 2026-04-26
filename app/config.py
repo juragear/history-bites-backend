@@ -19,7 +19,12 @@ class Settings(BaseSettings):
     MODEL_PROVIDER: Literal["gemini", "ollama"] = "gemini"
 
     GEMINI_API_KEY: str | None = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # Default upgraded to Gemini 3 Flash in Step 13e. Verified via
+    # client.models.list() against the live API (display name "Gemini 3 Flash
+    # Preview"). No stable variant exists yet — using the preview is the only
+    # path to Gemini 3 quality. Fall back to "gemini-2.5-flash" by setting
+    # GEMINI_MODEL on Railway / .env if the preview is ever deprecated.
+    GEMINI_MODEL: str = "gemini-3-flash-preview"
 
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "gemma4:latest"

@@ -181,13 +181,47 @@ def mock_wikipedia(monkeypatch):
             return override
         cand = next((c for c in state["candidates"] if c.title == title), None)
         page_id = cand.page_id if cand else 9999
+        # Step 13e: mock extracts must satisfy MIN_EXTRACT_CHARS (1500) and
+        # _looks_infoboxy's paragraph-density check (>=30% of paragraphs are
+        # >=200 chars). Two long narrative paragraphs (>200 chars each)
+        # totalling >1500 chars satisfies both. Title is interpolated so the
+        # extract still varies per candidate, which the side-effect test
+        # cases rely on for distinguishability.
+        narrative = (
+            f"{title} is a test article about an obscure historical topic, "
+            "constructed for the integration test suite to exercise the "
+            "pre-filter and generation pipeline as Step 13e shipped them. "
+            "The first paragraph is intentionally long enough to cross the "
+            "two-hundred character threshold that the infobox-shape detector "
+            "uses to distinguish narrative prose from infobox fragments, and "
+            "the entire mocked extract is deliberately wide enough to clear "
+            "the fifteen-hundred character floor that gates thin articles. "
+            "Without these properties the integration tests would all skip "
+            "via the new no-budget-cost pre-filter paths and look like silent "
+            "broken instead of like accurate happy-path coverage."
+            "\n\n"
+            f"In a second long paragraph, {title} continues with additional "
+            "fictional historical context. The mock pretends there were "
+            "consequences in the following century, that the practice spread "
+            "to neighbouring polities, and that scholarly debate has shifted "
+            "over the last fifty years. None of this is real history; it "
+            "exists only so the section-aware truncation does not produce a "
+            "stub-shaped fixture that the new pre-filter would correctly "
+            "reject under realistic conditions, and so the model-provider "
+            "stub has enough material to plausibly generate a single fact."
+            "\n\n"
+            "A third paragraph extends the narrative further so the mock "
+            "comfortably clears the fifteen-hundred character floor without "
+            "depending on the precise wording of the first two. This block "
+            "describes hypothetical archaeological work, a hypothetical "
+            "modern dispute over interpretation, and the kind of ancillary "
+            "context that real Wikipedia articles include in their second "
+            "and third sections after the lead paragraph closes."
+        )
         return wikipedia.ArticleExtract(
             page_id=page_id,
             title=title,
-            extract=(
-                f"{title} is a test article about an obscure historical topic "
-                "with enough text to satisfy the model provider stub."
-            ),
+            extract=narrative,
             source_url=f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
         )
 

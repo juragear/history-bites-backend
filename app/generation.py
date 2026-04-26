@@ -1,22 +1,33 @@
 """Generation pipeline: Wikipedia article -> Gemini/Ollama -> pool row.
 
 Single public orchestrator: `generate_one_pool_fact(session)`. It picks a random
-curated category, lists candidate articles, filters out ones already used in
-either `facts` or `pool` (D3: topic-level uniqueness), and tries up to 3
-candidates in sequence. For each, it fetches the extract, asks the configured
-ModelProvider for a one-sentence fact, validates, and inserts into `pool` with
-`status='pending_review'` (D9).
+curated category, lists candidate articles (Step 13e: title regex pre-filter
+applied at list_candidates time), filters out ones already used in either
+`facts` or `pool` (D3: topic-level uniqueness), and tries up to 3 candidates
+in sequence. For each, it fetches the section-aware truncated extract (Step
+13e), applies the post-fetch pre-filter (extract length floor +
+infobox-shape detector), asks the configured ModelProvider for a fact,
+validates, runs the per-category template-dedup check, and inserts into
+`pool` with `status='pending_review'` (D9).
 
-Validation (D5/D20): non-empty after strip() AND len <= 280. No n-gram check,
-no semantic similarity. Copyright safety relies on V1_PROMPT + human review.
+Validation (D5/D20): non-empty after strip() AND len <= MAX_FACT_CHARS. No
+n-gram check, no semantic similarity. Copyright safety relies on the prompt
++ human review. Step 13e: `MAX_FACT_CHARS` raised from 280 to 400 to fit
+V3_PROMPT's 200-350 typical / 400 hard-cap target.
 
 The retry budget is candidate-focused, not unconditional:
-  - 4xx from Wikipedia fetch_extract (stale title, redirect, deleted)
+  - 4xx / WikipediaNotFound from fetch_extract (stale title, redirect, deleted)
     -> skip to next candidate, does NOT count against the 3-try budget
+  - Step 13e: thin extract (<MIN_EXTRACT_CHARS post-truncation) or
+    infobox-shape extract -> skip to next candidate, does NOT count against
+    the budget. Pre-filter rejection; the model was never called.
   - IntegrityError on insert (lost a race to another generator)
     -> skip to next candidate, does NOT count against the budget
   - Provider error / validation failure / non-4xx HTTP error
     -> counts against the budget
+  - Step 13e: template-dupe (first 8 words match any of the last 5 facts in
+    the same category) -> counts against the budget. Model produced
+    something but we're rejecting it for novelty.
 Budget exhausted or candidates exhausted -> GenerationFailed.
 """
 from __future__ import annotations
@@ -41,6 +52,28 @@ logger = logging.getLogger(__name__)
 
 MAX_CANDIDATE_ATTEMPTS = 3
 
+# Step 13e: extract length floor (post-truncation). Articles whose section-
+# aware truncated extract falls under this are too thin to produce good
+# content even with a perfect prompt. The v1/v2 cohorts had multiple stub
+# articles (Konda_Kanga_ruins, Wu'an_Circuit, Aterazawa_Tateyama_Castle)
+# whose lead paragraph was OK but the full body was empty. After the section
+# truncator drops References and prioritizes History, anything left under
+# 1500 chars is genuinely thin.
+MIN_EXTRACT_CHARS = 1500
+
+# Step 13e: char cap raised from 280 to 400 to accommodate V3_PROMPT's wider
+# 200-350 typical / 400 hard-cap target. Two-sentence facts that land both
+# the headline and the so-what need room.
+MAX_FACT_CHARS = 400
+
+# Step 13e: per-category template-dedup window. The new fact's first 8 words
+# (lowercased, whitespace-collapsed) are matched against the last 5 facts
+# in the same category. 5 is generous enough to catch the "X served as Y in
+# Z BC" repeat pattern that produced 3 near-identical Roman consul facts
+# without being so wide that legitimate variation gets blocked.
+TEMPLATE_DEDUP_WINDOW = 5
+TEMPLATE_DEDUP_OPENER_WORDS = 8
+
 
 class GenerationFailed(Exception):
     """Raised when every attempted candidate failed. Caller decides what to do."""
@@ -51,7 +84,53 @@ class NoApprovedPool(Exception):
 
 
 def is_valid(fact: str) -> bool:
-    return bool(fact.strip()) and len(fact) <= 280
+    return bool(fact.strip()) and len(fact) <= MAX_FACT_CHARS
+
+
+def _looks_infoboxy(extract: str) -> bool:
+    """Heuristic: extracts where most content is short fragments rather than
+    narrative paragraphs. Returns True if the article should be skipped.
+
+    Some articles pass MIN_EXTRACT_CHARS but are mostly infobox-shaped
+    content — short lines, dates, names, formal titles, no real prose. The
+    paragraph-density signal catches these without an LLM call.
+
+    Threshold: <30% of paragraphs are >=200 chars (narrative-length).
+    """
+    paragraphs = [p for p in extract.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return True
+    long_paragraphs = [p for p in paragraphs if len(p) >= 200]
+    ratio = len(long_paragraphs) / len(paragraphs)
+    return ratio < 0.3
+
+
+def _opener_key(fact: str) -> str:
+    """First N words, lowercased and whitespace-collapsed. Used by
+    `_is_template_dupe` to compare opener shapes across category siblings.
+    """
+    return " ".join(fact.split()[:TEMPLATE_DEDUP_OPENER_WORDS]).lower()
+
+
+def _is_template_dupe(session: Session, category: str, fact_text: str) -> bool:
+    """Return True if `fact_text`'s opener matches any of the last 5 facts
+    in the same category. Catches the "X served as Y in Z BC" template
+    pattern that produced near-identical Roman consul / Victoria election
+    repeats in v1/v2.
+    """
+    new_opener = _opener_key(fact_text)
+    if not new_opener:
+        return False
+    recent = session.execute(
+        select(PoolFact.fact_text)
+        .where(PoolFact.category == category)
+        .order_by(PoolFact.created_at.desc())
+        .limit(TEMPLATE_DEDUP_WINDOW)
+    ).all()
+    for (existing,) in recent:
+        if _opener_key(existing) == new_opener:
+            return True
+    return False
 
 
 def get_used_external_ids(session: Session, source_name: str) -> set[str]:
@@ -128,6 +207,14 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
 
         try:
             extract = await wikipedia.fetch_extract(candidate.title)
+        except wikipedia.WikipediaNotFound:
+            # Step 13e: action API "missing" marker -> same skip semantics as
+            # an old 4xx (article was deleted or renamed). No budget cost.
+            logger.warning(
+                "wikipedia missing, picking different article",
+                extra={"extra": {"title": candidate.title}},
+            )
+            continue
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if 400 <= status < 500:
@@ -165,6 +252,26 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
             failures.append(f"{candidate.title}: wikipedia {exc!r}")
             continue
 
+        # Step 13e: post-fetch pre-filter. Both checks skip without budget
+        # cost — they reject before the model is called.
+        if len(extract.extract) < MIN_EXTRACT_CHARS:
+            logger.info(
+                "skip_thin_extract",
+                extra={
+                    "extra": {
+                        "title": candidate.title,
+                        "extract_chars": len(extract.extract),
+                    }
+                },
+            )
+            continue
+        if _looks_infoboxy(extract.extract):
+            logger.info(
+                "skip_infoboxy",
+                extra={"extra": {"title": candidate.title}},
+            )
+            continue
+
         try:
             fact_text = await provider.extract_fact(extract.extract)
         except ModelProviderError as exc:
@@ -193,6 +300,24 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
             failures.append(
                 f"{candidate.title}: invalid (len={len(fact_text)})"
             )
+            continue
+
+        # Step 13e: per-category template-dedup. Counts against budget
+        # because the model successfully produced output — we're rejecting
+        # it for novelty reasons, and a different angle on retry might land.
+        if _is_template_dupe(session, category, fact_text):
+            logger.info(
+                "skip_template_dupe",
+                extra={
+                    "extra": {
+                        "title": candidate.title,
+                        "category": category,
+                        "fact_preview": fact_text[:80],
+                    }
+                },
+            )
+            attempts += 1
+            failures.append(f"{candidate.title}: template_dupe")
             continue
 
         row = PoolFact(
