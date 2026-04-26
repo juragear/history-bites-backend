@@ -20,6 +20,7 @@ from app.model_provider import (
     V1_PROMPT,
     V3_PROMPT,
     V4_PROMPT,
+    V4_1_PROMPT,
     get_active_prompt,
 )
 
@@ -37,6 +38,14 @@ def test_get_active_prompt_returns_v4_for_v4():
     stay within source) targeting the v3 bottom-5 failure modes.
     """
     assert get_active_prompt("v4") is V4_PROMPT
+
+
+def test_get_active_prompt_returns_v4_1_for_v4_1():
+    """Step 13f addition: V4_1 is a tonal variant of V4 (warm + lightly
+    playful voice for morning delivery). Registry key uses the dotted
+    form 'v4.1' to make the relationship to v4 explicit.
+    """
+    assert get_active_prompt("v4.1") is V4_1_PROMPT
 
 
 def test_get_active_prompt_rejects_dropped_v2():
