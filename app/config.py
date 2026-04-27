@@ -56,8 +56,13 @@ class Settings(BaseSettings):
     # APPROVED_ALERT_THRESHOLD (D8): if approved pool count drops below this
     # at the end of a generation cron, send_alert fires so Will knows to review
     # more. 3 = roughly one push-day of buffer.
+    # APPROVED_TARGET (D8, surfaced in Step 14): three-tier buffer depth
+    # target. /health.approved_status returns 'ok' when approved >= TARGET,
+    # 'warm' when ALERT_THRESHOLD <= approved < TARGET, 'low' below
+    # ALERT_THRESHOLD. 7 days is the documented buffer per D8.
     REVIEW_QUEUE_TARGET: int = 20
     APPROVED_ALERT_THRESHOLD: int = 3
+    APPROVED_TARGET: int = 7
 
     # Step 12: CORS allowlist for any future browser-based admin/dashboard
     # client. Comma-separated origins; "*" allows any. Default is "*" for

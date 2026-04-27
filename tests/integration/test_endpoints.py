@@ -233,3 +233,60 @@ def test_health_503_when_db_unreachable(client, monkeypatch):
     body = resp.json()
     assert body["status"] == "degraded"
     assert body["db"] == "down"
+    # Step 14: degraded path returns 'unknown' for approved_status (DB
+    # probe failed; we can't compute the count).
+    assert body["approved_status"] == "unknown"
+
+
+# Step 14 (D8 surface): /health.approved_status three-tier mapping. Defaults
+# in the test environment match production: APPROVED_TARGET=7, ALERT=3.
+
+
+def _seed_approved(db, n: int) -> None:
+    """Seed n approved pool rows. Used by the three-tier tests below."""
+    for i in range(n):
+        db.add(
+            PoolFact(
+                fact_text=f"approved {i}",
+                source_name="wikipedia",
+                source_url=f"u{i}",
+                source_license="L",
+                external_id=f"a-{i}",
+                language="en",
+                model_used="m",
+                prompt_version="v1",
+                status="approved",
+            )
+        )
+    db.commit()
+
+
+def test_health_approved_status_ok_at_or_above_target(client, db):
+    """approved >= APPROVED_TARGET (default 7) -> 'ok'."""
+    _seed_approved(db, 7)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["approved_status"] == "ok"
+
+
+def test_health_approved_status_warm_in_alert_to_target_band(client, db):
+    """ALERT_THRESHOLD (3) <= approved < APPROVED_TARGET (7) -> 'warm'."""
+    _seed_approved(db, 4)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["approved_status"] == "warm"
+
+
+def test_health_approved_status_low_below_alert_threshold(client, db):
+    """approved < ALERT_THRESHOLD (3) -> 'low'."""
+    _seed_approved(db, 1)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["approved_status"] == "low"
+
+
+def test_health_approved_status_low_at_zero(client, db):
+    """Empty pool is 'low' (alerting territory)."""
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["approved_status"] == "low"

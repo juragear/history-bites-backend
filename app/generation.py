@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from app import wikipedia
 from app.config import settings
+from app.judge import Judge, JudgeError, JudgeResult
 from app.model_provider import ModelProviderError, get_provider
 from app.models import Fact, PoolFact
 
@@ -73,6 +74,21 @@ MAX_FACT_CHARS = 400
 # without being so wide that legitimate variation gets blocked.
 TEMPLATE_DEDUP_WINDOW = 5
 TEMPLATE_DEDUP_OPENER_WORDS = 8
+
+
+# Step 14: lazy module-level Judge singleton. The Judge constructor is cheap
+# (just reads the calibration .md once via app.judge module-level load) but
+# we still want one instance per process — no benefit to rebuilding the
+# wrapper for every cron tick. Tests monkeypatch this attribute directly to
+# inject a FakeJudge.
+_judge: Judge | None = None
+
+
+def _get_judge() -> Judge:
+    global _judge
+    if _judge is None:
+        _judge = Judge()
+    return _judge
 
 
 class GenerationFailed(Exception):
@@ -320,6 +336,54 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
             failures.append(f"{candidate.title}: template_dupe")
             continue
 
+        # Step 14: judge gate. Runs after validation + dedup so we don't
+        # spend a Gemini call evaluating a fact we'd reject anyway. Judge
+        # failures don't stop generation — they route the row to operator
+        # review with a stub reason. Per D23, the goal is "most volume
+        # autopilot, human in the loop on edge cases" — never lose a
+        # generated fact to a judge outage.
+        try:
+            judge_result = await _get_judge().evaluate(extract, fact_text)
+        except JudgeError as exc:
+            logger.warning(
+                "judge_failed_routing_to_human",
+                extra={
+                    "extra": {
+                        "title": candidate.title,
+                        "error": str(exc),
+                    }
+                },
+            )
+            judge_result = JudgeResult(
+                score=3.0,
+                verdict="borderline",
+                reason=f"judge unavailable: {exc}"[:300],
+            )
+
+        # Map verdict -> status. auto_reject rows still get inserted (status
+        # 'rejected') so the audit trail survives — schedule_tomorrows_fact
+        # only ever looks at status='approved' so rejected rows naturally
+        # don't reach users.
+        if judge_result.verdict == "auto_approve":
+            row_status = "approved"
+        elif judge_result.verdict == "auto_reject":
+            row_status = "rejected"
+        else:
+            row_status = "pending_review"
+
+        logger.info(
+            "judge verdict",
+            extra={
+                "extra": {
+                    "title": candidate.title,
+                    "score": judge_result.score,
+                    "verdict": judge_result.verdict,
+                    "row_status": row_status,
+                    "reason_preview": judge_result.reason[:120],
+                }
+            },
+        )
+
         row = PoolFact(
             fact_text=fact_text,
             source_name="wikipedia",
@@ -332,7 +396,10 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
             era=era,
             model_used=model_used,
             prompt_version=settings.PROMPT_VERSION,
-            status="pending_review",
+            status=row_status,
+            judge_score=judge_result.score,
+            judge_verdict=judge_result.verdict,
+            judge_reason=judge_result.reason,
         )
         session.add(row)
         try:

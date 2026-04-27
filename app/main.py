@@ -210,6 +210,20 @@ def archive(
     return ArchiveResponse(items=items, count=len(items))
 
 
+def _approved_status(approved_count: int) -> str:
+    """D8 three-tier mapping (surfaced on /health in Step 14).
+
+    >= APPROVED_TARGET   -> 'ok'    (target buffer met; cron in steady state)
+    >= ALERT_THRESHOLD   -> 'warm'  (below target but not paging; cron tops up)
+    <  ALERT_THRESHOLD   -> 'low'   (below alert floor; Slack alert fires)
+    """
+    if approved_count >= settings.APPROVED_TARGET:
+        return "ok"
+    if approved_count >= settings.APPROVED_ALERT_THRESHOLD:
+        return "warm"
+    return "low"
+
+
 @app.get("/health", response_model=HealthResponse)
 def health(response: Response) -> HealthResponse:
     try:
@@ -239,6 +253,7 @@ def health(response: Response) -> HealthResponse:
             db="down",
             pool_pending_count=0,
             pool_approved_count=0,
+            approved_status="unknown",
             latest_scheduled_date=None,
             last_push_at=None,
         )
@@ -248,6 +263,7 @@ def health(response: Response) -> HealthResponse:
         db="ok",
         pool_pending_count=pending,
         pool_approved_count=approved,
+        approved_status=_approved_status(approved),
         latest_scheduled_date=latest,
         last_push_at=last_push_at,
     )

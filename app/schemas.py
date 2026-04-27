@@ -45,5 +45,12 @@ class HealthResponse(BaseModel):
     db: Literal["ok", "down"]
     pool_pending_count: int
     pool_approved_count: int
+    # Step 14 (D8 surface): three-tier operational signal derived from
+    # pool_approved_count vs APPROVED_TARGET / APPROVED_ALERT_THRESHOLD.
+    # 'ok' when approved >= APPROVED_TARGET (default 7),
+    # 'warm' when APPROVED_ALERT_THRESHOLD <= approved < APPROVED_TARGET,
+    # 'low' when approved < APPROVED_ALERT_THRESHOLD.
+    # 'unknown' when the DB probe failed (status='degraded' path).
+    approved_status: Literal["ok", "warm", "low", "unknown"] = "unknown"
     latest_scheduled_date: date | None = None
     last_push_at: datetime | None = None

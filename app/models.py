@@ -7,8 +7,10 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     Index,
     SmallInteger,
+    String,
     Text,
     UniqueConstraint,
     func,
@@ -80,6 +82,20 @@ class PoolFact(Base):
             "review_rating IS NULL OR (review_rating BETWEEN 1 AND 5)",
             name="ck_pool_review_rating_range",
         ),
+        # Step 14 (D23): LLM-as-judge fields. judge_score is the predicted
+        # rating in [1.0, 5.0]; judge_verdict is the threshold-mapped bucket;
+        # judge_reason is a short audit string from the judge call. All
+        # nullable: pre-Step-14 rows have NULL across the three; rows
+        # generated post-Step-14 always have all three populated (judge
+        # failures populate verdict='borderline' with reason explaining why).
+        CheckConstraint(
+            "judge_score IS NULL OR (judge_score >= 1.0 AND judge_score <= 5.0)",
+            name="ck_pool_judge_score_range",
+        ),
+        CheckConstraint(
+            "judge_verdict IS NULL OR judge_verdict IN ('auto_approve', 'auto_reject', 'borderline')",
+            name="ck_pool_judge_verdict_values",
+        ),
         Index("idx_pool_status", "status"),
     )
 
@@ -112,6 +128,10 @@ class PoolFact(Base):
     # (>=4 -> approved, <=3 -> rejected). NULL on freshly-generated rows and on
     # pre-D26 rows that have been reset to pending_review for re-rating.
     review_rating: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Step 14 (D23): judge fields. See CheckConstraints above for ranges.
+    judge_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    judge_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    judge_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

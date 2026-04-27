@@ -246,6 +246,21 @@ class ModelProvider(Protocol):
         """
         ...
 
+    async def generate_text(self, prompt: str) -> str:
+        """Run an arbitrary prompt through the model and return raw text.
+
+        Step 14: parallel path to extract_fact for callers that want to
+        provide their own prompt structure and parse their own response
+        (e.g. app.judge which embeds a few-shot calibration prompt and
+        parses its own JSON `{"score": ..., "reason": ...}` output).
+
+        Implementations request JSON output mode where the SDK supports
+        it (Gemini, Ollama) so the caller's `json.loads(...)` is safe.
+        Implementations do NOT pass a response_schema — schema is the
+        caller's responsibility.
+        """
+        ...
+
 
 def _parse_fact_json(raw: str, *, provider: str, model: str) -> str:
     try:
@@ -297,6 +312,28 @@ class GeminiProvider:
             )
         return _parse_fact_json(raw, provider="gemini", model=self._model)
 
+    async def generate_text(self, prompt: str) -> str:
+        """Step 14: bare-prompt JSON-mode call. No schema (caller-owned)."""
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+        )
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self._model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception as exc:
+            raise ModelProviderError(
+                f"gemini:{self._model} generate_text API call failed: {exc!r}"
+            ) from exc
+        raw = (response.text or "").strip()
+        if not raw:
+            raise ModelProviderError(
+                f"gemini:{self._model} generate_text returned empty response text"
+            )
+        return raw
+
 
 class OllamaProvider:
     def __init__(self, base_url: str, model: str) -> None:
@@ -331,6 +368,32 @@ class OllamaProvider:
                 f"ollama:{self._model} returned empty 'response' field: {body!r}"
             )
         return _parse_fact_json(raw, provider="ollama", model=self._model)
+
+    async def generate_text(self, prompt: str) -> str:
+        """Step 14: bare-prompt JSON-mode call. No schema (caller-owned)."""
+        payload = {
+            "model": self._model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{self._base_url}/api/generate", json=payload
+                )
+                resp.raise_for_status()
+                body = resp.json()
+        except httpx.HTTPError as exc:
+            raise ModelProviderError(
+                f"ollama:{self._model} generate_text HTTP call failed: {exc!r}"
+            ) from exc
+        raw = (body.get("response") or "").strip()
+        if not raw:
+            raise ModelProviderError(
+                f"ollama:{self._model} generate_text returned empty 'response': {body!r}"
+            )
+        return raw
 
 
 def get_provider() -> ModelProvider:

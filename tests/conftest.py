@@ -239,8 +239,20 @@ def mock_provider(monkeypatch):
       - an Exception     -> raised
       - a callable       -> called with the article extract, return value used
     state["calls"] tracks invocation count for assertions.
+
+    Step 14: also patches `app.generation._judge` with a FakeJudge that
+    returns a configurable JudgeResult. Default is borderline (score=3.5)
+    so existing tests that assert `status == 'pending_review'` keep
+    passing without modification. Tests that want auto_approve / auto_reject
+    behaviour mutate state["judge_score"] (or judge_verdict / judge_reason
+    explicitly) to override.
+
+    state["judge_error"] override: set to an Exception instance to force
+    the judge to raise that exception (exercises the
+    judge_failed_routing_to_human path).
     """
     from app import generation, model_provider
+    from app.judge import JudgeResult
 
     state = {
         "fact_text": (
@@ -248,6 +260,13 @@ def mock_provider(monkeypatch):
             "a notable moment in fictional historiography."
         ),
         "calls": 0,
+        # Step 14 judge state. Defaults to borderline so pre-Step-14 tests
+        # that assert status='pending_review' continue passing.
+        "judge_score": 3.5,
+        "judge_verdict": "borderline",
+        "judge_reason": "test fixture default — borderline routes to review",
+        "judge_calls": 0,
+        "judge_error": None,
     }
 
     class _FakeProvider:
@@ -260,11 +279,30 @@ def mock_provider(monkeypatch):
                 return ft(article_extract)
             return ft
 
+    class _FakeJudge:
+        async def evaluate(self, article_extract, fact_text):
+            state["judge_calls"] += 1
+            err = state.get("judge_error")
+            if err is not None:
+                # Mirror the real provider-failure path: raise JudgeError so
+                # generate_one_pool_fact's except clause routes to review.
+                from app.judge import JudgeError
+                raise JudgeError(str(err)) if not isinstance(err, Exception) else err
+            return JudgeResult(
+                score=state["judge_score"],
+                verdict=state["judge_verdict"],
+                reason=state["judge_reason"],
+            )
+
     fake_factory = lambda: _FakeProvider()  # noqa: E731
     monkeypatch.setattr(model_provider, "get_provider", fake_factory)
     # generation.py did `from app.model_provider import get_provider`, which
     # rebinds the name into generation's namespace. Patch that copy too.
     monkeypatch.setattr(generation, "get_provider", fake_factory)
+    # Inject the fake judge directly into the lazy module global. The real
+    # _get_judge() helper checks for None before constructing, so a non-None
+    # value here means tests bypass the real Judge() entirely.
+    monkeypatch.setattr(generation, "_judge", _FakeJudge())
     return state
 
 
