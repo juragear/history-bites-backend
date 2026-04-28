@@ -40,7 +40,28 @@ class JSONFormatter(logging.Formatter):
         extra = record.__dict__.get("extra")
         if isinstance(extra, dict):
             payload.update(extra)
-        return json.dumps(payload)
+
+        # Code Review Fix 3 (P2.1): render exception info when logger.exception(...)
+        # was called or exc_info=True was passed. Without this, the formatter
+        # silently drops the traceback that the call site explicitly asked for —
+        # `admin.py:725` (admin_run_generation broad except) and `cron.py:344`
+        # (cron CLI catch-all) both rely on logger.exception for production
+        # diagnostics; before this fix neither produced a stack trace in Railway
+        # logs. exc_type / exc_message are split out as separate fields for
+        # search ergonomics; traceback carries the full multi-line render via
+        # the parent class's formatException helper.
+        if record.exc_info:
+            exc_type, exc_value, _exc_tb = record.exc_info
+            if exc_type is not None:
+                payload["exc_type"] = exc_type.__name__
+                payload["exc_message"] = str(exc_value) if exc_value else ""
+                payload["traceback"] = self.formatException(record.exc_info)
+
+        # `default=str` is a safety net for non-JSON-serializable values that
+        # might land in `extra` (e.g. a datetime, a Decimal). Without it, a
+        # stray non-serializable extra would crash the formatter mid-emit and
+        # take the surrounding log line with it.
+        return json.dumps(payload, default=str)
 
 
 # Code Review Fix 1 (P2.2): match `?` followed by anything up to the next

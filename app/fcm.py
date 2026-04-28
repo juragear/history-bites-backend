@@ -23,6 +23,7 @@ from typing import Any
 import firebase_admin
 from firebase_admin import credentials, messaging
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
@@ -49,6 +50,21 @@ def _get_firebase_app() -> firebase_admin.App:
     The service-account JSON lives in env (FIREBASE_SERVICE_ACCOUNT_JSON) as a
     single string — Railway env vars don't preserve real newlines well, but
     JSON's `\\n`-encoded private_key handles fine through json.loads.
+
+    Code Review Fix 3 (P3.1 + Fix-2-deferred-P3.2): the cert + init block is
+    wrapped to (a) recover from the duplicate-init race that the Chunk 2
+    audit flagged — `if _app is None:` is a check-then-set, two threads can
+    both pass the None check and the second `initialize_app(cred)` call
+    raises `ValueError: app already exists`; (b) wrap the otherwise-bare
+    `ValueError` from `credentials.Certificate(...)` (malformed PEM,
+    missing private_key field) and any FirebaseError subclass from
+    `initialize_app(...)` so callers see a single FCMError type instead of
+    a leaky bare ValueError.
+
+    Log lines record only `error_type`, never `str(exc)` — the full chain
+    travels via the `from exc` cause to whatever upstream logger.exception
+    catches the FCMError (now actually rendered as a traceback in JSON
+    logs, per Fix 3 P2.1).
     """
     global _app
     if _app is None:
@@ -56,10 +72,46 @@ def _get_firebase_app() -> firebase_admin.App:
             sa_dict = json.loads(settings.FIREBASE_SERVICE_ACCOUNT_JSON)
         except json.JSONDecodeError as exc:
             raise FCMError(
-                f"FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: {exc}"
+                "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON; "
+                "see server logs for details"
             ) from exc
-        cred = credentials.Certificate(sa_dict)
-        _app = firebase_admin.initialize_app(cred)
+
+        try:
+            cred = credentials.Certificate(sa_dict)
+            _app = firebase_admin.initialize_app(cred)
+        except ValueError as exc:
+            # Two cases reach this branch:
+            #   1. credentials.Certificate(...) on a malformed/incomplete SA
+            #      dict — bare ValueError.
+            #   2. firebase_admin.initialize_app(...) on the duplicate-init
+            #      race — ValueError("the default Firebase app already
+            #      exists ...").
+            # Try the race-recovery path first; if get_app() also raises
+            # ValueError, the default app genuinely doesn't exist and the
+            # original ValueError was a real init failure (case 1). Wrap
+            # as FCMError with a scrubbed message either way.
+            try:
+                _app = firebase_admin.get_app()
+            except ValueError:
+                logger.warning(
+                    "firebase init failed",
+                    extra={"extra": {"error_type": type(exc).__name__}},
+                )
+                raise FCMError(
+                    "firebase init failed; see server logs for details"
+                ) from exc
+        except Exception as exc:
+            # Any FirebaseError subclass or auth/network error reaching the
+            # cert validator path. Same scrubbing posture: type only on the
+            # log line; full chain via the cause.
+            logger.warning(
+                "firebase init failed",
+                extra={"extra": {"error_type": type(exc).__name__}},
+            )
+            raise FCMError(
+                "firebase init failed; see server logs for details"
+            ) from exc
+
         logger.info(
             "firebase_admin initialized",
             extra={"extra": {"project_id": sa_dict.get("project_id")}},
@@ -96,6 +148,10 @@ def _is_transient(exc: BaseException) -> bool:
     wait=wait_exponential(multiplier=1, min=1),
     retry=retry_if_exception(_is_transient),
     reraise=True,
+    # Code Review Fix 3 (P3.2): same rationale as wikipedia._get_json —
+    # without this, transient FCM 5xx / DeadlineExceeded retries are silent
+    # and the operator can't tell a one-off blip from a sustained outage.
+    before_sleep=before_sleep_log(logger, logging.INFO),
 )
 def _send_with_retry(message: messaging.Message, app: firebase_admin.App) -> str:
     return messaging.send(message, app=app)

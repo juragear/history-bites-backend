@@ -270,3 +270,41 @@ def test_cli_run_generation_returns_1_on_unhandled_exception(monkeypatch):
     monkeypatch.setattr(cron, "run_generation", _boom)
     rc = cron._main(["app.cron", "run_generation"])
     assert rc == 1
+
+
+def test_cli_run_generation_crash_alert_does_not_leak_repr(monkeypatch):
+    """Code Review Fix 3 (P3.3): the cron crash handler used to send
+    `repr(exc)` to the Slack webhook, which for an OperationalError leaks
+    the DB hostname / port into the alert channel. The fix sends only the
+    exception type name; the full traceback stays in Railway via
+    logger.exception (which renders correctly after Fix 3 P2.1)."""
+    sent_alerts: list[str] = []
+    monkeypatch.setattr(cron, "send_alert", lambda msg: sent_alerts.append(msg))
+
+    async def _operational_error(session):
+        from sqlalchemy.exc import OperationalError
+
+        raise OperationalError(
+            "SELECT 1",
+            params={},
+            orig=Exception(
+                "connection to server at \"db.internal.example\" "
+                "(123.45.67.89), port 12345 failed"
+            ),
+        )
+
+    monkeypatch.setattr(cron, "run_generation", _operational_error)
+    rc = cron._main(["app.cron", "run_generation"])
+
+    assert rc == 1
+    assert len(sent_alerts) == 1
+    msg = sent_alerts[0]
+
+    # Type name + sentinel are present
+    assert "OperationalError" in msg
+    assert "see Railway logs" in msg
+
+    # Concrete leak strings must NOT reach Slack
+    assert "db.internal.example" not in msg
+    assert "12345" not in msg
+    assert "SELECT 1" not in msg

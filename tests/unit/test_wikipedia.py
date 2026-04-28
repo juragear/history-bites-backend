@@ -135,3 +135,70 @@ def test_select_sections_lead_only_no_body_sections():
     """Article with only a lead and no headers passes through unchanged."""
     lead = "This is the entire article content with no section headers at all."
     assert _select_sections(lead) == lead
+
+
+# --- Code Review Fix 3 (P3.2): tenacity before_sleep_log on _get_json -----
+
+
+def test_get_json_emits_before_sleep_log_on_transient_5xx(monkeypatch, caplog):
+    """P3.2: tenacity's before_sleep hook must emit a log line per retry
+    attempt. Pre-fix the retries were silent — operators couldn't tell from
+    Railway logs alone whether Wikipedia hit a transient 5xx-and-recovered
+    or just succeeded outright."""
+    import asyncio
+    import logging as _logging
+
+    import httpx
+
+    from app import wikipedia as wiki_module
+
+    call_count = {"n": 0}
+
+    class _FakeResponse:
+        def __init__(self, status: int) -> None:
+            self.status_code = status
+            self.request = httpx.Request("GET", "https://en.wikipedia.org/w/api.php")
+            self._json = {"query": {"pages": {}}}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {self.status_code}",
+                    request=self.request,
+                    response=httpx.Response(self.status_code, request=self.request),
+                )
+
+        def json(self) -> dict:
+            return self._json
+
+    class _FakeClient:
+        async def get(self, url: str, params: dict | None = None):
+            call_count["n"] += 1
+            # First attempt 503 (triggers retry); second attempt 200.
+            if call_count["n"] == 1:
+                return _FakeResponse(503)
+            return _FakeResponse(200)
+
+    monkeypatch.setattr(wiki_module, "_get_client", lambda: _FakeClient())
+
+    with caplog.at_level(_logging.INFO, logger="app.wikipedia"):
+        result = asyncio.run(
+            wiki_module._get_json("https://en.wikipedia.org/w/api.php")
+        )
+
+    # The retry path actually fired (so the recovery happened)
+    assert call_count["n"] == 2
+    assert result == {"query": {"pages": {}}}
+
+    # tenacity's before_sleep_log emits at our INFO level. The exact message
+    # text is tenacity-internal; assert by looking for the canonical
+    # "Retrying" prefix that before_sleep_log uses.
+    retry_logs = [
+        r
+        for r in caplog.records
+        if r.name == "app.wikipedia" and "Retrying" in r.getMessage()
+    ]
+    assert len(retry_logs) >= 1, (
+        "Expected at least one before_sleep log entry on transient 5xx; "
+        f"got {[r.getMessage() for r in caplog.records if r.name == 'app.wikipedia']}"
+    )

@@ -341,12 +341,19 @@ def _main(argv: list[str]) -> int:
             try:
                 asyncio.run(run_generation(session))
             except Exception as exc:
+                # Code Review Fix 3 (P3.3): Slack is a third-party SaaS;
+                # `repr(exc)` of an OperationalError leaks the DB hostname /
+                # port into the alert channel. Send only the type name, which
+                # is enough to distinguish "DB outage" vs "config bug" at
+                # glance. Full traceback stays in Railway via logger.exception
+                # (now actually rendered, per Fix 3 P2.1).
                 logger.exception(
                     "run_generation: unhandled error",
                     extra={"extra": {"error": repr(exc)}},
                 )
                 send_alert(
-                    f"HistoryBites: run_generation crashed: {exc!r}"
+                    f"HistoryBites: run_generation crashed "
+                    f"({type(exc).__name__}); see Railway logs"
                 )
                 return 1
         return 0

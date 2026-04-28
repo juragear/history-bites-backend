@@ -246,10 +246,18 @@ async def admin_generate(
     try:
         row = await generation.generate_one_pool_fact(db)
     except generation.GenerationFailed as exc:
+        # Code Review Fix 3 (P2.3): the 503 detail used to stringify `exc`
+        # verbatim, which leaked `gemini-3-flash-preview API call failed:
+        # ClientError("503 UNAVAILABLE...")` plus every attempted Wikipedia
+        # title into the response body. `from exc` keeps the cause chain so
+        # logger.exception(...) anywhere upstream still gets the full
+        # traceback (after Fix 3 P2.1 wired traceback rendering into
+        # JSONFormatter). The structured logger.warning below carries
+        # str(exc) into Railway server-side; the wire stays clean.
         logger.warning("admin generate failed", extra={"extra": {"error": str(exc)}})
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"generation failed: {exc}",
+            detail="generation failed; see server logs for details",
         ) from exc
 
     return GenerateResponse(
@@ -675,10 +683,15 @@ def admin_push(
     try:
         result = cron.run_push(db)
     except fcm.FCMError as exc:
+        # Code Review Fix 3 (P2.4): the 503 detail used to stringify the
+        # FCMError, which embeds the FCM topic + the firebase-admin exception
+        # class verbatim (e.g. `UnregisteredError: Requested entity was not
+        # found.`). The structured warning below carries that to Railway;
+        # the wire stays clean.
         logger.warning("admin push failed", extra={"extra": {"error": str(exc)}})
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"fcm send failed: {exc}",
+            detail="fcm send failed; see server logs for details",
         ) from exc
 
     if result is None:
@@ -722,13 +735,19 @@ async def admin_run_generation(
     try:
         summary = await cron.run_generation(db)
     except Exception as exc:
+        # Code Review Fix 3 (P2.2): the 503 detail used to stringify `exc`,
+        # which for the realistic SQLAlchemy OperationalError case dumped the
+        # DB hostname + IP + port + full SQL + bind parameters into the
+        # response body. logger.exception now actually captures the traceback
+        # in Railway (Fix 3 P2.1) so the wire-side scrub doesn't lose any
+        # operator information.
         logger.exception(
             "admin run_generation crashed",
             extra={"extra": {"error": repr(exc)}},
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"run_generation failed: {exc}",
+            detail="run_generation failed; see server logs for details",
         ) from exc
 
     return RunGenerationResponse(**summary)

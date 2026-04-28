@@ -18,12 +18,14 @@ Both share a single httpx.AsyncClient (10s timeout, User-Agent from settings)
 and are wrapped in tenacity retry that backs off on transient failures (network
 errors, 5xx) but fails fast on 4xx (e.g. 404 — the article just doesn't exist).
 """
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
@@ -31,6 +33,9 @@ from tenacity import (
 )
 
 from app.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 ACTION_API_URL = "https://en.wikipedia.org/w/api.php"
@@ -99,6 +104,12 @@ def _should_retry(exc: BaseException) -> bool:
     wait=wait_exponential(multiplier=1, min=1),
     retry=retry_if_exception(_should_retry),
     reraise=True,
+    # Code Review Fix 3 (P3.2): without this hook, tenacity retries are
+    # silent — operator sees the eventual outcome but no signal that the
+    # call hit transient flakiness on the way. INFO level keeps the noise
+    # floor low (one line per retry-attempted) while making sustained 5xx
+    # visible in Railway logs.
+    before_sleep=before_sleep_log(logger, logging.INFO),
 )
 async def _get_json(url: str, params: dict | None = None) -> dict:
     client = _get_client()

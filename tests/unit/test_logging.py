@@ -1,20 +1,23 @@
-"""Unit tests for app.main.StripQueryStringFormatter.
+"""Unit tests for app.main.StripQueryStringFormatter and JSONFormatter.
 
-Code Review Fix 1 (P2.2): the formatter is what stops the bleed at the
-source — without it, uvicorn's default access log captures
+Code Review Fix 1 (P2.2): StripQueryStringFormatter stops query-string secrets
+at the source — without it, uvicorn's default access log captures
 `/admin/review?token=<value>` verbatim into Railway logs.
 
-The formatter mutates `record.args` index 2 (uvicorn's `full_path` arg)
-before delegating to the parent formatter. These tests pin that contract:
-the request-line path is stripped of `?...`, non-access records are not
-mangled, and the full_path arg's substitution doesn't disturb args[0]
-(client_addr) or args[4] (status code).
+Code Review Fix 3 (P2.1): JSONFormatter renders exception info when
+`logger.exception(...)` is called. Without this, the two production catch-all
+sites (`admin.py:725` and `cron.py:344`) silently drop the traceback they
+explicitly asked for — operators saw only `repr(exc)` in Railway, no stack
+frames. These tests pin the formatter's exception-rendering contract.
 """
 from __future__ import annotations
 
+import json
 import logging
+import sys
+from datetime import datetime
 
-from app.main import StripQueryStringFormatter
+from app.main import JSONFormatter, StripQueryStringFormatter
 
 
 def _make_uvicorn_access_record(full_path: str) -> logging.LogRecord:
@@ -96,3 +99,109 @@ def test_strip_query_string_formatter_safe_on_short_args():
     )
     output = formatter.format(record)
     assert output == "some unrelated log message"
+
+
+# --- Code Review Fix 3 (P2.1): JSONFormatter exception rendering ----------
+
+
+def test_json_formatter_renders_exception_traceback():
+    """P2.1: logger.exception(...) must produce exc_type, exc_message,
+    traceback fields. Before Fix 3, the formatter dropped record.exc_info
+    silently and the two production catch-all sites produced log lines with
+    no stack frames at all."""
+    formatter = JSONFormatter()
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="",
+            lineno=0,
+            msg="crash",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+
+    output = json.loads(formatter.format(record))
+
+    assert output["exc_type"] == "ValueError"
+    assert output["exc_message"] == "boom"
+    assert "traceback" in output
+    assert "ValueError" in output["traceback"]
+    assert "boom" in output["traceback"]
+
+
+def test_json_formatter_omits_exception_fields_when_no_exc_info():
+    """P2.1: regular log calls must not gain traceback fields. The exception
+    rendering only fires when exc_info is set on the record."""
+    formatter = JSONFormatter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="just a log",
+        args=(),
+        exc_info=None,
+    )
+
+    output = json.loads(formatter.format(record))
+
+    assert "exc_type" not in output
+    assert "exc_message" not in output
+    assert "traceback" not in output
+
+
+def test_json_formatter_handles_non_serializable_extra():
+    """Safety: a non-JSON-serializable extra value falls back to str() rather
+    than crashing the formatter. Without `default=str` on json.dumps, a stray
+    datetime / Decimal / Path in `extra` would take the whole log line with
+    it instead of just being stringified."""
+    formatter = JSONFormatter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="event",
+        args=(),
+        exc_info=None,
+    )
+    record.__dict__["extra"] = {"when": datetime(2026, 1, 1)}
+
+    # Should not raise — `default=str` falls back cleanly.
+    output = json.loads(formatter.format(record))
+    assert "when" in output
+    # The datetime got stringified; we don't assert the exact format because
+    # datetime.__str__ is "2026-01-01 00:00:00" which is fine for log search.
+    assert "2026" in output["when"]
+
+
+def test_json_formatter_includes_extra_alongside_exception_fields():
+    """exc_type / exc_message / traceback go alongside extra, not inside it.
+    A logger.exception call with extra={...} must produce both blocks."""
+    formatter = JSONFormatter()
+    try:
+        raise RuntimeError("upstream timeout")
+    except RuntimeError:
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="",
+            lineno=0,
+            msg="run failed",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+    record.__dict__["extra"] = {"operation": "run_generation", "iter": 3}
+
+    output = json.loads(formatter.format(record))
+
+    # extras land at top level
+    assert output["operation"] == "run_generation"
+    assert output["iter"] == 3
+    # exception fields land at top level too
+    assert output["exc_type"] == "RuntimeError"
+    assert output["exc_message"] == "upstream timeout"
+    assert "traceback" in output

@@ -190,6 +190,105 @@ async def test_admin_generate_failure_returns_503(
     assert "generation failed" in resp.json()["detail"]
 
 
+def test_admin_generate_503_does_not_leak_provider_details(
+    client, admin_token, monkeypatch
+):
+    """Code Review Fix 3 (P2.3): /admin/generate 503 detail must not contain
+    the chained Gemini error or model name. The pre-fix detail string was
+    `f"generation failed: {exc}"` which leaked `gemini-3-flash-preview`,
+    `ClientError(...)`, and every attempted Wikipedia title."""
+    from app.generation import GenerationFailed
+
+    leaky_msg = (
+        "Category:Han_dynasty: 3 attempts exhausted. "
+        "Failures: ['Article: provider gemini:gemini-3-flash-preview API "
+        "call failed: ClientError(\"503 UNAVAILABLE...\")']"
+    )
+
+    async def raise_generation_failed(*args, **kwargs):
+        raise GenerationFailed(leaky_msg)
+
+    monkeypatch.setattr(
+        "app.generation.generate_one_pool_fact", raise_generation_failed
+    )
+    resp = client.post("/admin/generate", headers=_bearer(admin_token))
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+
+    assert "see server logs" in detail
+    # Concrete leak strings traced in the Chunk 3 audit must NOT appear:
+    assert "gemini-3-flash-preview" not in detail
+    assert "ClientError" not in detail
+    assert "Han_dynasty" not in detail
+    assert "UNAVAILABLE" not in detail
+
+
+def test_admin_run_generation_503_does_not_leak_db_details(
+    client, admin_token, monkeypatch
+):
+    """Code Review Fix 3 (P2.2): /admin/cron/run-generation 503 detail must
+    not contain SQLAlchemy schema or DB connection details. The pre-fix
+    detail string for an OperationalError leaked DB hostname, IP, port, the
+    full SQL statement, and the bind parameters."""
+    from sqlalchemy.exc import OperationalError
+
+    async def raise_operational_error(*args, **kwargs):
+        raise OperationalError(
+            "SELECT count(*) FROM pool WHERE pool.status = %(status_1)s",
+            params={"status_1": "pending_review"},
+            orig=Exception(
+                "connection to server at \"db.internal.example\" "
+                "(123.45.67.89), port 12345 failed"
+            ),
+        )
+
+    monkeypatch.setattr("app.cron.run_generation", raise_operational_error)
+    resp = client.post(
+        "/admin/cron/run-generation", headers=_bearer(admin_token)
+    )
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+
+    assert "see server logs" in detail
+    # Concrete leak strings traced in the Chunk 3 audit must NOT appear:
+    assert "db.internal.example" not in detail
+    assert "12345" not in detail
+    assert "OperationalError" not in detail
+    assert "SELECT" not in detail
+    assert "status_1" not in detail
+
+
+def test_admin_push_503_does_not_leak_firebase_details(
+    client, admin_token, db, mock_fcm
+):
+    """Code Review Fix 3 (P2.4): /admin/push 503 detail must not contain
+    the FCM topic or the firebase-admin exception class. The pre-fix detail
+    leaked `topic='daily-fact'`, the notification title, and the
+    `UnregisteredError: Requested entity was not found.` chained string."""
+    today = date.today()
+    db.add(_fact(scheduled_date=today, external_id="ex-today"))
+    db.commit()
+
+    leaky_msg = (
+        "FCM send failed (topic='daily-fact', title='HistoryBites'): "
+        "UnregisteredError: Requested entity was not found."
+    )
+    mock_fcm["message_id"] = fcm.FCMError(leaky_msg)
+
+    resp = client.post("/admin/push", headers=_bearer(admin_token))
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+
+    assert "see server logs" in detail
+    # Concrete leak strings traced in the Chunk 3 audit must NOT appear:
+    assert "UnregisteredError" not in detail
+    assert "daily-fact" not in detail
+    assert "Requested entity" not in detail
+
+
 # --- /admin/flush-pool ------------------------------------------------------
 
 
