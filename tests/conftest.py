@@ -38,6 +38,7 @@ from sqlalchemy.ext.compiler import compiles  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
+from app import admin as app_admin  # noqa: E402
 from app import cron as app_cron  # noqa: E402
 from app import db as app_db  # noqa: E402
 from app import main as app_main  # noqa: E402
@@ -82,6 +83,11 @@ app_db.engine = _TEST_ENGINE
 app_db.SessionLocal = _TestSessionLocal
 app_main.SessionLocal = _TestSessionLocal
 app_cron.SessionLocal = _TestSessionLocal
+# Code Review Fix 4 (P2.3): /admin/cron/status uses SessionLocal directly so
+# the 503-on-DB-outage test can monkeypatch the binding to simulate
+# session-creation failure. Test fixture needs the same patching as the
+# other modules that imported SessionLocal by name.
+app_admin.SessionLocal = _TestSessionLocal
 
 
 def _override_get_db():

@@ -2,25 +2,35 @@ import json
 import logging
 import re
 import sys
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import wikipedia
 from app.admin import (
     review_page_router as admin_review_page_router,
     router as admin_router,
 )
 from app.config import settings
 from app.db import SessionLocal, get_db
-from app.models import Fact, PoolFact
+from app.models import Fact
 from app.schemas import (
     ArchiveItem,
     ArchiveResponse,
+    ErrorDetail,
     HealthResponse,
     TodayResponse,
 )
@@ -128,7 +138,25 @@ configure_logging()
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="HistoryBites backend")
+
+# Code Review Fix 4 (P3.3): migrate from the deprecated `@app.on_event(...)`
+# decorators to FastAPI's lifespan context manager (FastAPI ≥ 0.93).
+# Startup is empty by design — every initialization in this codebase is
+# lazy (Firebase, Gemini, Wikipedia client). Shutdown calls
+# `wikipedia.aclose()` so the module-level httpx singleton drains its
+# connection pool gracefully on Railway pod restart instead of having
+# in-flight requests torn down ungracefully when uvicorn receives SIGTERM.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "lifespan: startup", extra={"extra": {"environment": settings.ENVIRONMENT}}
+    )
+    yield
+    await wikipedia.aclose()
+    logger.info("lifespan: shutdown — wikipedia client closed")
+
+
+app = FastAPI(title="HistoryBites backend", lifespan=lifespan)
 
 # Step 12: CORS for any future browser-based admin/dashboard. Bearer-token
 # auth in headers doesn't need cookies, so allow_credentials stays False —
@@ -149,6 +177,15 @@ app.include_router(admin_router)
 # separate sub-router with the query-friendly auth dependency. Every other
 # admin endpoint stays on the strict main router.
 app.include_router(admin_review_page_router)
+
+
+# Code Review Fix 4 (P2.1): public endpoints live on a versioned router.
+# Mobile Architecture commits to `/v1/` for Phase 2 F2 — this is that
+# implementation. Future breaking changes to the public contract bump the
+# prefix (e.g. `/v2/today`) without disturbing deployed Flutter clients;
+# non-breaking additions stay under `/v1/`. Admin endpoints stay
+# unversioned at `/admin/*` because they're internal — no client to break.
+public_router = APIRouter(prefix="/v1")
 
 
 # D21c: date-keyed in-memory cache for /today. Keyed by today's ISO date so a
@@ -186,11 +223,6 @@ def invalidate_today_cache(scheduled_date: date) -> None:
         logger.info("today cache invalidated", extra={"extra": {"date": key}})
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    logger.info("app startup", extra={"extra": {"environment": settings.ENVIRONMENT}})
-
-
 def _fact_to_today(row: Fact, *, is_stale: bool) -> TodayResponse:
     return TodayResponse(
         scheduled_date=row.scheduled_date,
@@ -202,8 +234,26 @@ def _fact_to_today(row: Fact, *, is_stale: bool) -> TodayResponse:
     )
 
 
-@app.get("/today", response_model=TodayResponse)
-def today(db: Annotated[Session, Depends(get_db)]) -> TodayResponse:
+@public_router.get(
+    "/today",
+    response_model=TodayResponse,
+    responses={
+        404: {
+            "model": ErrorDetail,
+            "description": "No fact scheduled and no fallback available.",
+        },
+    },
+)
+def today(
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+) -> TodayResponse:
+    # Code Review Fix 4 (P2.4): surface the in-memory cache TTL on the wire
+    # so dio (Flutter's HTTP client) and Cloudflare (D13, Phase 3) can share
+    # the same cache window. `public` because the response is the same for
+    # every user (D7: same-fact-for-everyone). 300s matches CACHE_TTL above.
+    response.headers["Cache-Control"] = "public, max-age=300"
+
     today_date = date.today()
     key = today_date.isoformat()
 
@@ -263,21 +313,37 @@ def today(db: Annotated[Session, Depends(get_db)]) -> TodayResponse:
     return resp
 
 
-@app.get("/archive", response_model=ArchiveResponse)
+@public_router.get("/archive", response_model=ArchiveResponse)
 def archive(
     db: Annotated[Session, Depends(get_db)],
     limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    before: Annotated[date | None, Query()] = None,
 ) -> ArchiveResponse:
-    rows = (
-        db.execute(
-            select(Fact)
-            .where(Fact.is_retracted.is_(False))
-            .order_by(Fact.scheduled_date.desc())
-            .limit(limit)
-        )
-        .scalars()
-        .all()
+    """Cursor-paginated archive (Code Review Fix 4 P2.5).
+
+    Order: `scheduled_date DESC`. Stable because `scheduled_date` is UNIQUE
+    on the facts table — no ties to break. `?before=<date>` walks older
+    pages (open interval, `scheduled_date < before`); the response's
+    `next_before` is the cursor for the next call, or `null` on the final
+    page.
+
+    Implementation note: fetching `limit + 1` rows in one query is the
+    cheap way to compute `has_more` without a separate `COUNT(*)` round
+    trip. Slice off the extra row before serializing; use it only to set
+    `next_before`.
+    """
+    query = (
+        select(Fact)
+        .where(Fact.is_retracted.is_(False))
+        .order_by(Fact.scheduled_date.desc())
     )
+    if before is not None:
+        query = query.where(Fact.scheduled_date < before)
+
+    rows = list(db.execute(query.limit(limit + 1)).scalars())
+    has_more = len(rows) > limit
+    page = rows[:limit]
+
     items = [
         ArchiveItem(
             scheduled_date=r.scheduled_date,
@@ -286,65 +352,55 @@ def archive(
             source_name=r.source_name,
             source_license=r.source_license,
         )
-        for r in rows
+        for r in page
     ]
-    return ArchiveResponse(items=items, count=len(items))
+    next_before = page[-1].scheduled_date if has_more and page else None
+    return ArchiveResponse(items=items, next_before=next_before)
 
 
-def _approved_status(approved_count: int) -> str:
-    """D8 three-tier mapping (surfaced on /health in Step 14).
-
-    >= APPROVED_TARGET   -> 'ok'    (target buffer met; cron in steady state)
-    >= ALERT_THRESHOLD   -> 'warm'  (below target but not paging; cron tops up)
-    <  ALERT_THRESHOLD   -> 'low'   (below alert floor; Slack alert fires)
-    """
-    if approved_count >= settings.APPROVED_TARGET:
-        return "ok"
-    if approved_count >= settings.APPROVED_ALERT_THRESHOLD:
-        return "warm"
-    return "low"
-
-
-@app.get("/health", response_model=HealthResponse)
+@public_router.get(
+    "/health",
+    response_model=HealthResponse,
+    responses={
+        503: {
+            "model": ErrorDetail,
+            "description": "Database probe failed; service is degraded.",
+        },
+    },
+)
 def health(response: Response) -> HealthResponse:
+    """Public connectivity probe (Code Review Fix 4 P2.3).
+
+    Status only — no operational metrics. The rich operational view (pool
+    counts, scheduling runway, last push time) moved to
+    `/admin/cron/status`, which is admin-token-gated. Anyone can hit
+    /v1/health without auth, so it stays minimal: connectivity for
+    Flutter's HTTP client + Railway's healthcheck plumbing.
+
+    Uses `SessionLocal()` directly (not `Depends(get_db)`) so the existing
+    503-on-DB-outage test can monkeypatch this module's `SessionLocal`
+    binding to simulate connection failure at session-creation time. The
+    rest of the codebase that needs `get_db()` semantics keeps using the
+    dependency.
+    """
     try:
         with SessionLocal() as db:
-            pending = db.execute(
-                select(func.count())
-                .select_from(PoolFact)
-                .where(PoolFact.status == "pending_review")
-            ).scalar_one()
-            approved = db.execute(
-                select(func.count())
-                .select_from(PoolFact)
-                .where(PoolFact.status == "approved")
-            ).scalar_one()
-            latest = db.execute(select(func.max(Fact.scheduled_date))).scalar_one()
-            # Step 9: most-recent-wins MAX(pushed_at) — single scalar query
-            # against the same Session, no extra round trip beyond the one
-            # we'd already need. Small table, no index required.
-            last_push_at = db.execute(
-                select(func.max(Fact.pushed_at))
-            ).scalar_one()
-    except SQLAlchemyError as exc:
-        logger.warning("health db probe failed", extra={"extra": {"error": str(exc)}})
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return HealthResponse(
-            status="degraded",
-            db="down",
-            pool_pending_count=0,
-            pool_approved_count=0,
-            approved_status="unknown",
-            latest_scheduled_date=None,
-            last_push_at=None,
+            # Trivial scalar query — round-trips the connection without
+            # depending on the data shape (works against an empty DB).
+            db.execute(select(Fact.id).limit(1)).first()
+    except Exception as exc:  # SQLAlchemyError + dialect-level errors
+        # Code Review Fix 3 (P2.1) traceback rendering carries the full
+        # chain into Railway via logger.exception elsewhere; here a
+        # warning with the type name is enough to scope the alert.
+        logger.warning(
+            "health db probe failed",
+            extra={"extra": {"error_type": type(exc).__name__}},
         )
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return HealthResponse(status="degraded", db="down")
 
-    return HealthResponse(
-        status="ok",
-        db="ok",
-        pool_pending_count=pending,
-        pool_approved_count=approved,
-        approved_status=_approved_status(approved),
-        latest_scheduled_date=latest,
-        last_push_at=last_push_at,
-    )
+    return HealthResponse(status="ok", db="ok")
+
+
+# Wire the public router last so all decorators above are bound first.
+app.include_router(public_router)

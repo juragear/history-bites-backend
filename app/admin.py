@@ -30,7 +30,7 @@ import logging
 import secrets
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
@@ -40,6 +40,7 @@ from fastapi import (
     Header,
     Query,
     Request,
+    Response,
     status,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -51,7 +52,7 @@ from sqlalchemy.orm import Session
 
 from app import cron, fcm, generation
 from app.config import settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import Fact, PoolFact
 from app.review_tags import (
     InvalidRatingError,
@@ -59,6 +60,7 @@ from app.review_tags import (
     derive_status_from_rating,
     validate_tags,
 )
+from app.schemas import CronStatusResponse, ErrorDetail
 
 
 logger = logging.getLogger(__name__)
@@ -155,9 +157,20 @@ async def verify_admin_token_with_query(
 # Main admin router — strict auth (no query-string token). Every admin POST
 # endpoint registered against this router automatically inherits the strict
 # posture. New endpoints get strict auth for free.
+#
+# Code Review Fix 4 (P2.2): the router-level `responses=` declares the 401
+# shape that the auth dependency raises on missing/invalid tokens. Every
+# endpoint inherits this, so OpenAPI consumers see the 401 surface
+# consistently across all admin routes without per-endpoint repetition.
 router = APIRouter(
     prefix="/admin",
     dependencies=[Depends(verify_admin_token_strict)],
+    responses={
+        401: {
+            "model": ErrorDetail,
+            "description": "Missing or invalid admin token.",
+        },
+    },
 )
 
 # Separate sub-router for the GET /admin/review HTML page only. Isolating
@@ -167,6 +180,12 @@ router = APIRouter(
 review_page_router = APIRouter(
     prefix="/admin",
     dependencies=[Depends(verify_admin_token_with_query)],
+    responses={
+        401: {
+            "model": ErrorDetail,
+            "description": "Missing or invalid admin token.",
+        },
+    },
 )
 
 
@@ -237,7 +256,20 @@ class RunGenerationResponse(BaseModel):
 # --- POST /admin/generate ----------------------------------------------------
 
 
-@router.post("/generate", response_model=GenerateResponse)
+@router.post(
+    "/generate",
+    response_model=GenerateResponse,
+    responses={
+        503: {
+            "model": ErrorDetail,
+            "description": (
+                "Generation failed (Wikipedia unavailable, Gemini unavailable, "
+                "or the candidate budget was exhausted). Detail string is the "
+                "Code Review Fix 3 sentinel; full chain in server logs."
+            ),
+        },
+    },
+)
 async def admin_generate(
     db: Annotated[Session, Depends(get_db)],
 ) -> GenerateResponse:
@@ -294,6 +326,20 @@ def admin_flush_pool(
 @router.post(
     "/schedule/{pool_id}/{target_date}",
     response_model=ScheduleResponse,
+    responses={
+        404: {
+            "model": ErrorDetail,
+            "description": "Pool row not found (already consumed or never existed).",
+        },
+        400: {
+            "model": ErrorDetail,
+            "description": "Pool row exists but its status is not 'approved'.",
+        },
+        409: {
+            "model": ErrorDetail,
+            "description": "Target date is already scheduled (race lost).",
+        },
+    },
 )
 def admin_schedule(
     pool_id: int,
@@ -400,6 +446,12 @@ _RETRACT_NOTE = (
 @router.post(
     "/retract/{target_date}",
     response_model=RetractResponse,
+    responses={
+        404: {
+            "model": ErrorDetail,
+            "description": "No active fact for this date (already retracted or never scheduled).",
+        },
+    },
 )
 def admin_retract(
     target_date: date,
@@ -524,7 +576,24 @@ def _apply_review(
     return row
 
 
-@router.post("/review/{pool_id}", response_model=ReviewActionResponse)
+@router.post(
+    "/review/{pool_id}",
+    response_model=ReviewActionResponse,
+    responses={
+        303: {"description": "Form submission redirect back to the review page."},
+        400: {
+            "model": ErrorDetail,
+            "description": (
+                "Validation failure: missing/out-of-range rating, unknown tag, "
+                "or malformed JSON body."
+            ),
+        },
+        404: {
+            "model": ErrorDetail,
+            "description": "Pool row not found.",
+        },
+    },
+)
 async def admin_review(
     pool_id: int,
     request: Request,
@@ -666,7 +735,24 @@ async def admin_review(
 # --- POST /admin/push --------------------------------------------------------
 
 
-@router.post("/push", response_model=PushResponse)
+@router.post(
+    "/push",
+    response_model=PushResponse,
+    responses={
+        400: {
+            "model": ErrorDetail,
+            "description": "No active fact for today (not scheduled or retracted).",
+        },
+        503: {
+            "model": ErrorDetail,
+            "description": (
+                "FCM send failed after retries. Detail string is the Code "
+                "Review Fix 3 sentinel; full firebase exception chain is in "
+                "server logs."
+            ),
+        },
+    },
+)
 def admin_push(
     db: Annotated[Session, Depends(get_db)],
 ) -> PushResponse:
@@ -715,7 +801,19 @@ def admin_push(
 # --- POST /admin/cron/run-generation -----------------------------------------
 
 
-@router.post("/cron/run-generation", response_model=RunGenerationResponse)
+@router.post(
+    "/cron/run-generation",
+    response_model=RunGenerationResponse,
+    responses={
+        503: {
+            "model": ErrorDetail,
+            "description": (
+                "Unhandled error during the cron run. Detail string is the "
+                "Code Review Fix 3 sentinel; full traceback in server logs."
+            ),
+        },
+    },
+)
 async def admin_run_generation(
     db: Annotated[Session, Depends(get_db)],
 ) -> RunGenerationResponse:
@@ -753,14 +851,108 @@ async def admin_run_generation(
     return RunGenerationResponse(**summary)
 
 
-# --- GET /admin/review -------------------------------------------------------
+# --- GET /admin/cron/status (Code Review Fix 4 P2.3) ------------------------
 #
-# Lives on `review_page_router`, NOT `router`. The sub-router pattern keeps the
-# query-string-friendly auth (`verify_admin_token_with_query`) isolated to this
-# one HTML page and out of the strict-by-default policy on every POST endpoint.
+# Replaces the rich operational shape that pre-Fix-4 /health used to return.
+# /v1/health is now a thin status-only probe for unauthenticated callers
+# (Flutter, Railway healthcheck); operator-facing metrics live here, gated
+# by the strict admin auth.
 
 
-@review_page_router.get("/review", response_class=HTMLResponse)
+def _approved_status(approved_count: int) -> Literal["ok", "warm", "low"]:
+    """D8 three-tier mapping (originally surfaced via /health in Step 14;
+    moved here in Fix 4 alongside the rest of the operational view).
+
+    >= APPROVED_TARGET   -> 'ok'    (target buffer met; cron in steady state)
+    >= ALERT_THRESHOLD   -> 'warm'  (below target but not paging; cron tops up)
+    <  ALERT_THRESHOLD   -> 'low'   (below alert floor; Slack alert fires)
+    """
+    if approved_count >= settings.APPROVED_TARGET:
+        return "ok"
+    if approved_count >= settings.APPROVED_ALERT_THRESHOLD:
+        return "warm"
+    return "low"
+
+
+@router.get(
+    "/cron/status",
+    response_model=CronStatusResponse,
+    responses={
+        503: {
+            "model": ErrorDetail,
+            "description": "Database probe failed; metrics unavailable.",
+        },
+    },
+)
+def admin_cron_status(response: Response) -> CronStatusResponse:
+    """Operator-gated operational view (Code Review Fix 4 P2.3).
+
+    Returns the same shape pre-Fix-4 /health returned: pool counts +
+    scheduling runway + last push time + D8 three-tier signal. Gated by
+    the standard router-level admin auth so an unauthenticated observer
+    can't infer pool size or cron timing by polling.
+
+    Uses `SessionLocal()` directly (not `Depends(get_db)`) so failures at
+    session-creation time can be surfaced as a clean 503 with a
+    `degraded` body rather than a 500 from the dependency machinery —
+    matches the /v1/health failure shape exactly.
+    """
+    try:
+        with SessionLocal() as db:
+            pending = db.execute(
+                select(func.count())
+                .select_from(PoolFact)
+                .where(PoolFact.status == "pending_review")
+            ).scalar_one()
+            approved = db.execute(
+                select(func.count())
+                .select_from(PoolFact)
+                .where(PoolFact.status == "approved")
+            ).scalar_one()
+            latest = db.execute(
+                select(func.max(Fact.scheduled_date))
+            ).scalar_one()
+            # Step 9 carryover: most-recent-wins MAX(pushed_at).
+            last_push_at = db.execute(
+                select(func.max(Fact.pushed_at))
+            ).scalar_one()
+    except Exception as exc:  # SQLAlchemyError + dialect-level errors
+        logger.warning(
+            "cron status db probe failed",
+            extra={"extra": {"error_type": type(exc).__name__}},
+        )
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return CronStatusResponse(
+            status="degraded",
+            db="down",
+            pool_pending_count=0,
+            pool_approved_count=0,
+            approved_status="unknown",
+            latest_scheduled_date=None,
+            last_push_at=None,
+        )
+
+    return CronStatusResponse(
+        status="ok",
+        db="ok",
+        pool_pending_count=pending,
+        pool_approved_count=approved,
+        approved_status=_approved_status(approved),
+        latest_scheduled_date=latest,
+        last_push_at=last_push_at,
+    )
+
+
+@review_page_router.get(
+    "/review",
+    response_class=HTMLResponse,
+    responses={
+        200: {
+            "description": "Renders the review queue HTML page.",
+            "content": {"text/html": {}},
+        },
+    },
+)
 def admin_review_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
