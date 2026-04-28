@@ -299,9 +299,19 @@ def mock_provider(monkeypatch):
     # generation.py did `from app.model_provider import get_provider`, which
     # rebinds the name into generation's namespace. Patch that copy too.
     monkeypatch.setattr(generation, "get_provider", fake_factory)
+    # Code Review Fix 2 (P2.1): the module-level _provider singleton caches
+    # the first construction for the process lifetime. Reset to None at
+    # fixture setup so each test gets a fresh lazy-init path — otherwise the
+    # FakeProvider from test N leaks into test N+1, and tests that re-patch
+    # generation.get_provider mid-test (e.g. swapping in a _SideEffectProvider)
+    # would silently see the stale cached instance instead of their override.
+    # monkeypatch.setattr reverts at end-of-test so we don't bleed the None
+    # back into other consumers either.
+    monkeypatch.setattr(generation, "_provider", None)
     # Inject the fake judge directly into the lazy module global. The real
     # _get_judge() helper checks for None before constructing, so a non-None
-    # value here means tests bypass the real Judge() entirely.
+    # value here means tests bypass the real Judge() entirely (and bypass the
+    # _get_provider() call inside the Judge constructor wiring).
     monkeypatch.setattr(generation, "_judge", _FakeJudge())
     return state
 

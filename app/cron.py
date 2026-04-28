@@ -67,9 +67,16 @@ def send_alert(message: str) -> None:
         return
 
     payload = {"text": message}
+    # Code Review Fix 2 (P2.2): context-managed httpx.Client instead of the
+    # httpx.post(...) shortcut. Same semantics — raise_for_status still routes
+    # 4xx/5xx into the same except clause as connection errors — but the client
+    # lifecycle is explicit and consistent with the rest of the codebase
+    # (wikipedia._client, OllamaProvider). Sync function, so httpx.Client (not
+    # AsyncClient).
     try:
-        response = httpx.post(url, json=payload, timeout=_ALERT_TIMEOUT_S)
-        response.raise_for_status()
+        with httpx.Client(timeout=_ALERT_TIMEOUT_S) as client:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.warning(
             "alert webhook delivery failed",

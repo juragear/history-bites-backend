@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 from app import wikipedia
 from app.config import settings
 from app.judge import Judge, JudgeError, JudgeResult
-from app.model_provider import ModelProviderError, get_provider
+from app.model_provider import ModelProvider, ModelProviderError, get_provider
 from app.models import Fact, PoolFact
 
 
@@ -76,18 +76,38 @@ TEMPLATE_DEDUP_WINDOW = 5
 TEMPLATE_DEDUP_OPENER_WORDS = 8
 
 
+# Code Review Fix 2 (P2.1): module-level lazy ModelProvider singleton. Was
+# previously rebuilt on every generate_one_pool_fact call, each constructing a
+# new genai.Client (which wraps its own httpx pool). The cron pod is short-
+# lived so OS reclaim handled it, but the long-running web pod accumulated
+# unclosed pools across /admin/generate calls. One instance per process now;
+# the pool is reused across all generations + judge calls. Mirrors the _judge
+# singleton pattern below; the judge is wired to share this same instance via
+# Judge(provider=_get_provider()) so we hold one provider per process, not two.
+_provider: ModelProvider | None = None
+
+
+def _get_provider() -> ModelProvider:
+    global _provider
+    if _provider is None:
+        _provider = get_provider()
+    return _provider
+
+
 # Step 14: lazy module-level Judge singleton. The Judge constructor is cheap
 # (just reads the calibration .md once via app.judge module-level load) but
 # we still want one instance per process — no benefit to rebuilding the
 # wrapper for every cron tick. Tests monkeypatch this attribute directly to
-# inject a FakeJudge.
+# inject a FakeJudge. Code Review Fix 2: now passes the shared _get_provider()
+# instance into Judge() so the judge and the generation path share one
+# underlying provider rather than constructing two.
 _judge: Judge | None = None
 
 
 def _get_judge() -> Judge:
     global _judge
     if _judge is None:
-        _judge = Judge()
+        _judge = Judge(provider=_get_provider())
     return _judge
 
 
@@ -200,7 +220,9 @@ async def generate_one_pool_fact(session: Session) -> PoolFact:
         )
 
     random.shuffle(fresh)
-    provider = get_provider()
+    # Code Review Fix 2 (P2.1): use the module-level singleton instead of
+    # constructing a new provider per call.
+    provider = _get_provider()
     model_used = f"{settings.MODEL_PROVIDER}:{_model_name()}"
 
     attempts = 0
