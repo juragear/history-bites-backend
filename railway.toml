@@ -5,7 +5,7 @@ builder = "NIXPACKS"
 startCommand = "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-healthcheckPath = "/health"
+healthcheckPath = "/v1/health"
 healthcheckTimeout = 30
 
 # Step 10: Railway native cron. Each [[cron]] block spawns a fresh container
