@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
@@ -10,7 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.admin import router as admin_router
+from app.admin import (
+    review_page_router as admin_review_page_router,
+    router as admin_router,
+)
 from app.config import settings
 from app.db import SessionLocal, get_db
 from app.models import Fact, PoolFact
@@ -39,12 +43,64 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(payload)
 
 
+# Code Review Fix 1 (P2.2): match `?` followed by anything up to the next
+# whitespace. Strips query strings out of uvicorn access-log request lines
+# (and only those — application logs go through the JSON formatter on the
+# root logger, which doesn't apply this transform).
+_QUERY_STRING_PATTERN = re.compile(r"\?[^\s]*")
+
+
+class StripQueryStringFormatter(logging.Formatter):
+    """Uvicorn access-log formatter that strips `?...` from the path arg.
+
+    Defense against query-string secrets (?token=..., ?api_key=..., etc.)
+    landing in stdout / Railway logs verbatim. Without this, hitting
+    `/admin/review?token=<value>` from a browser causes uvicorn's default
+    access logger to log the full URL including the token, which Railway
+    captures into log retention.
+
+    Verified against uvicorn 0.30 series — the access logger calls
+    `info('%s - "%s %s HTTP/%s" %d', client_addr, method, full_path,
+    http_version, status)` so `record.args[2]` is the path-with-query
+    string. If a future uvicorn version reorders args, this falls through
+    silently (the isinstance + length guards stay safe) and would need an
+    index update; simpler than scanning every arg.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        if record.args and len(record.args) >= 3:
+            args_list = list(record.args)
+            full_path = args_list[2]
+            if isinstance(full_path, str):
+                args_list[2] = _QUERY_STRING_PATTERN.sub("", full_path)
+                record.args = tuple(args_list)
+        return super().format(record)
+
+
 def configure_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
     root = logging.getLogger()
     root.setLevel(settings.LOG_LEVEL.upper())
     root.handlers = [handler]
+
+    # Code Review Fix 1 (P2.2): override uvicorn.access so the logged request
+    # line never contains a query string. We replace the default handler with
+    # one that uses StripQueryStringFormatter, then disable propagation so the
+    # access record doesn't ALSO go to root (which would re-emit it via the
+    # JSON handler with the original args still attached — note that the
+    # strip mutates record.args in place, so by the time the root handler
+    # would see it, args are clean too; but propagation off is cleaner).
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers = []
+    access_handler = logging.StreamHandler(sys.stdout)
+    access_handler.setFormatter(
+        StripQueryStringFormatter(
+            '%(asctime)s %(levelname)s uvicorn.access :: %(message)s'
+        )
+    )
+    access_logger.addHandler(access_handler)
+    access_logger.propagate = False
 
 
 configure_logging()
@@ -68,6 +124,10 @@ app.add_middleware(
 )
 
 app.include_router(admin_router)
+# Code Review Fix 1 (P2.1): the GET /admin/review HTML page lives on a
+# separate sub-router with the query-friendly auth dependency. Every other
+# admin endpoint stays on the strict main router.
+app.include_router(admin_review_page_router)
 
 
 # D21c: date-keyed in-memory cache for /today. Keyed by today's ISO date so a

@@ -89,8 +89,41 @@ def test_auth_accepts_bearer_header(client, admin_token, db):
     assert resp.status_code == 200
 
 
-def test_auth_accepts_query_param(client, admin_token, db):
+def test_auth_post_rejects_query_param(client, admin_token, db):
+    """Code Review Fix 1 (P2.1): POST endpoints must NOT accept ?token=... in
+    URL — only header or form. Query-string tokens land in access logs /
+    proxy logs / browser history, which is a leak surface we want closed.
+    The GET /admin/review HTML page is the one exception (covered below)."""
     resp = client.post(f"/admin/flush-pool?token={admin_token}")
+    assert resp.status_code == 401, "POST with ?token=... must fail under strict auth"
+
+
+def test_auth_post_rejects_query_param_on_admin_generate(
+    client, admin_token, mock_wikipedia, mock_provider
+):
+    """Same contract as test_auth_post_rejects_query_param but on /admin/generate
+    — sanity check that the strict policy is router-wide, not just one endpoint."""
+    resp = client.post(f"/admin/generate?token={admin_token}")
+    assert resp.status_code == 401
+
+
+def test_auth_review_get_accepts_query_param(client, admin_token):
+    """Code Review Fix 1 (P2.1): the GET /admin/review HTML page IS allowed to
+    accept ?token=... — browser navigations can't set Authorization headers, and
+    `StripQueryStringFormatter` ensures the token doesn't survive into access
+    logs. This is the one route in the codebase where query-string auth is OK."""
+    resp = client.get(f"/admin/review?token={admin_token}")
+    # 200 (page renders) is the success signal. We're testing auth, not content.
+    assert resp.status_code == 200, (
+        f"GET /admin/review with ?token=... should authenticate; got {resp.status_code}"
+    )
+
+
+def test_auth_review_get_accepts_bearer_header(client, admin_token):
+    """The GET review page also accepts the Bearer header, even though most
+    browsers can't set it on plain navigations — curl / Postman / future API
+    clients exercise this path."""
+    resp = client.get("/admin/review", headers=_bearer(admin_token))
     assert resp.status_code == 200
 
 

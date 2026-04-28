@@ -1,18 +1,24 @@
-"""Admin endpoints + review HTML page (Step 8).
+"""Admin endpoints + review HTML page (Step 8; auth split per Code Review
+Fix 1).
 
-Bearer-token auth on every route. The auth dependency accepts the token from
-EITHER an `Authorization: Bearer <token>` header (curl / Android-style) OR a
-`token` query/form param (browser-driven /admin/review page). This dual-source
-acceptance is the simplest path that lets:
-  - the GET /admin/review HTML page authenticate via `?token=...` in the URL
-    (browsers don't send Authorization headers on plain navigations), and
-  - the in-page <form action=...> rating POSTs authenticate via a hidden
-    `token` field (browsers don't send Authorization headers on plain form
-    posts either), and
-  - curl / Android / Postman use the standard Authorization header.
+Bearer-token auth on every route. **Two** auth dependencies:
 
-The "leak risk" of a token-in-URL is mitigated by HTTPS-everywhere on Railway.
-This is a single-user admin surface, not an OAuth provider.
+  - `verify_admin_token_strict` — accepts the token from `Authorization:
+    Bearer <token>` header OR a hidden `token` form field. The default for
+    every admin route. Query-string tokens are NOT accepted because
+    query-string secrets land in access logs / proxy logs / browser history.
+
+  - `verify_admin_token_with_query` — additionally accepts `?token=...` in
+    the URL. Used ONLY on the GET `/admin/review` HTML page, where browser
+    navigations can't set Authorization headers. The query-string surface is
+    isolated to this one read-only HTML route via a separate sub-router
+    (`review_page_router`) so a future POST endpoint added to the main
+    `router` automatically inherits the strict posture.
+
+Code Review Fix 1 (P2.1 + P2.2): paired with `StripQueryStringFormatter` in
+`app/main.py:configure_logging` which strips `?...` from uvicorn access-log
+request lines. Together: query-string tokens are accepted on exactly one
+HTTP route AND never persisted to logs, even on that route.
 
 D21d note: /admin/retract is no-new-views, NOT recall. The response body
 explicitly says so — Will needs to remember that pushing retract doesn't
@@ -72,6 +78,11 @@ def _extract_token(
     Header form: `Authorization: Bearer <token>`. We only accept the literal
     "Bearer" scheme — case-sensitive — to avoid silently accepting weird
     variants. Anything malformed returns None and the caller raises 401.
+
+    Either of `token_query` / `token_form` may be passed as None to indicate
+    "this auth variant does not accept this source" (the strict variant
+    passes None for `token_query` so URL-based tokens are never even
+    considered).
     """
     if authorization:
         parts = authorization.split()
@@ -85,17 +96,13 @@ def _extract_token(
     return None
 
 
-async def verify_admin_token(
-    authorization: Annotated[str | None, Header()] = None,
-    token: Annotated[str | None, Query()] = None,
-    token_form: Annotated[str | None, Form(alias="token")] = None,
-) -> None:
-    """Bearer-token guard for all /admin/* routes.
+def _check_token(candidate: str | None) -> None:
+    """Constant-time compare against settings.ADMIN_TOKEN. 401 on miss/bad.
 
-    Constant-time comparison via secrets.compare_digest — defends against
-    timing oracles even though this is single-user. Costs nothing to do right.
+    Shared by both auth-dependency variants (strict + with-query). Centralised
+    so the comparison + 401 shape are identical regardless of which route
+    triggered the check.
     """
-    candidate = _extract_token(authorization, token, token_form)
     if candidate is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -110,7 +117,57 @@ async def verify_admin_token(
         )
 
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(verify_admin_token)])
+async def verify_admin_token_strict(
+    authorization: Annotated[str | None, Header()] = None,
+    token_form: Annotated[str | None, Form(alias="token")] = None,
+) -> None:
+    """Default admin auth: accepts header or form ONLY — not query string.
+
+    Used on every admin endpoint EXCEPT the GET `/admin/review` HTML page
+    (which uses `verify_admin_token_with_query` because browser navigations
+    can't set Authorization headers). Query-string tokens are rejected here
+    because they end up in access logs, proxy logs, browser history, and
+    Referer headers — defense-in-depth complementing
+    `app/main.py:StripQueryStringFormatter`.
+    """
+    candidate = _extract_token(authorization, token_query=None, token_form=token_form)
+    _check_token(candidate)
+
+
+async def verify_admin_token_with_query(
+    authorization: Annotated[str | None, Header()] = None,
+    token: Annotated[str | None, Query()] = None,
+    token_form: Annotated[str | None, Form(alias="token")] = None,
+) -> None:
+    """Admin auth that ADDITIONALLY accepts `?token=...` in the URL.
+
+    Use ONLY on the GET `/admin/review` HTML page. Browsers can't set
+    Authorization headers on a plain navigation, and a hidden form field
+    can't be embedded in a navigation either, so the query-string path is
+    the only practical option for that one route. The
+    `StripQueryStringFormatter` in `app/main.py` ensures the token still
+    doesn't land in access logs even when used via this path.
+    """
+    candidate = _extract_token(authorization, token_query=token, token_form=token_form)
+    _check_token(candidate)
+
+
+# Main admin router — strict auth (no query-string token). Every admin POST
+# endpoint registered against this router automatically inherits the strict
+# posture. New endpoints get strict auth for free.
+router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(verify_admin_token_strict)],
+)
+
+# Separate sub-router for the GET /admin/review HTML page only. Isolating
+# the query-friendly auth posture to this one router means it can't bleed
+# into other endpoints by accident — a future POST added to `router` above
+# is naturally strict; only GETs explicitly registered HERE accept ?token=.
+review_page_router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(verify_admin_token_with_query)],
+)
 
 
 # --- response models ---------------------------------------------------------
@@ -678,15 +735,20 @@ async def admin_run_generation(
 
 
 # --- GET /admin/review -------------------------------------------------------
+#
+# Lives on `review_page_router`, NOT `router`. The sub-router pattern keeps the
+# query-string-friendly auth (`verify_admin_token_with_query`) isolated to this
+# one HTML page and out of the strict-by-default policy on every POST endpoint.
 
 
-@router.get("/review", response_class=HTMLResponse)
+@review_page_router.get("/review", response_class=HTMLResponse)
 def admin_review_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ) -> HTMLResponse:
     """Render the review queue. Auth is enforced by the router-level
-    dependency, which accepts ?token=... for browser navigations."""
+    dependency on `review_page_router`, which accepts ?token=... for
+    browser navigations (the only route in the codebase that does)."""
     pending = list(
         db.execute(
             select(PoolFact)
