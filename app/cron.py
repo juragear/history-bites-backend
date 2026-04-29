@@ -326,12 +326,20 @@ def _main(argv: list[str]) -> int:
             try:
                 run_push(session)
             except fcm.FCMError as exc:
-                logger.error(
-                    "run_push: FCM send failed",
-                    extra={"extra": {"error": str(exc)}},
-                )
+                # Code Review Fix 5 (Forensics tertiary): use logger.exception
+                # so JSONFormatter (Fix 3 P2.1) renders exc_type / exc_message /
+                # traceback into the structured log line. logger.error doesn't
+                # set record.exc_info, so the formatter would have emitted only
+                # `error: <repr>` — defeating Fix 3 on this branch. The sibling
+                # run_generation branch below was migrated correctly during
+                # Fix 3; this catches up. Surfaced by Push-Stale Forensics
+                # 2026-04-28 because no scheduled run_push had ever fired in
+                # production until Will registered the cron post-Forensics, so
+                # the gap was latent.
+                logger.exception("run_push: FCM send failed")
                 send_alert(
-                    f"HistoryBites: run_push failed to send to FCM: {exc}"
+                    f"HistoryBites: run_push failed to send to FCM "
+                    f"({type(exc).__name__}); see Railway logs"
                 )
                 return 1
         return 0

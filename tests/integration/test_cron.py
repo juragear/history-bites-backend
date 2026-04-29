@@ -249,6 +249,112 @@ def test_cli_run_push_returns_1_on_fcm_error(monkeypatch, db, mock_fcm):
     assert rc == 1
 
 
+def test_cli_run_push_logs_with_traceback_on_fcm_error(
+    monkeypatch, db, mock_fcm, caplog
+):
+    """Code Review Fix 5 (Forensics tertiary): the `_main` `run_push` branch
+    must use `logger.exception` so JSONFormatter (Fix 3 P2.1) renders
+    exc_type / exc_message / traceback into the structured log line.
+    Pre-Fix-5 the branch used `logger.error(...)` which doesn't set
+    record.exc_info, so the formatter would have emitted only the bare
+    `error: <repr>` extra. The sibling `run_generation` branch was migrated
+    correctly during Fix 3; this asserts the `run_push` branch caught up.
+
+    Two-layer assertion: (1) the LogRecord that the catch block produced
+    has `exc_info` set with the right exception type; (2) when serialised
+    through the production JSONFormatter, the resulting JSON contains
+    `exc_type`, `exc_message`, and `traceback` keys. The serialisation
+    layer is the actual regression guard — exc_info being set isn't
+    sufficient if the formatter regresses."""
+    import json
+    import logging as _logging
+
+    from app.main import JSONFormatter
+
+    today = date.today()
+    db.add(_fact(scheduled_date=today, external_id="ex-today"))
+    db.commit()
+
+    mock_fcm["message_id"] = fcm.FCMError("simulated transient failure")
+
+    with caplog.at_level(_logging.ERROR, logger="app.cron"):
+        rc = cron._main(["app.cron", "run_push"])
+    assert rc == 1
+
+    # Find the record from the FCMError catch block. logger.exception sets
+    # exc_info automatically; logger.error does not. The pre-Fix-5 shape
+    # would have produced a record with exc_info=None.
+    err_records = [
+        r
+        for r in caplog.records
+        if r.name == "app.cron"
+        and r.levelno == _logging.ERROR
+        and "FCM send failed" in r.getMessage()
+    ]
+    assert len(err_records) == 1, (
+        f"expected exactly one error record from FCMError catch; "
+        f"got {len(err_records)} in {[r.getMessage() for r in caplog.records]}"
+    )
+    rec = err_records[0]
+
+    # Layer 1: exc_info is set and points at the right exception type.
+    assert rec.exc_info is not None, (
+        "logger.exception must set record.exc_info; "
+        "regression to logger.error would set it to None"
+    )
+    assert rec.exc_info[0] is fcm.FCMError
+
+    # Layer 2: production JSONFormatter renders exc_type / exc_message /
+    # traceback. Without this, Fix 3's traceback rendering is wired to a
+    # call that doesn't set exc_info, defeating the diagnostic.
+    formatter = JSONFormatter()
+    payload = json.loads(formatter.format(rec))
+    assert payload["exc_type"] == "FCMError"
+    assert "simulated transient failure" in payload["exc_message"]
+    assert "traceback" in payload
+    assert "FCMError" in payload["traceback"]
+
+
+def test_cli_run_push_alert_does_not_leak_fcm_error_message(
+    monkeypatch, db, mock_fcm
+):
+    """Code Review Fix 5 (Forensics tertiary, alert-scrubbing half): the
+    Slack alert sent on FCMError must contain only the exception type name
+    + sentinel, not the chained exception message. Mirrors Fix 3 P3.3's
+    pattern on the `run_generation` branch (`type(exc).__name__` instead
+    of `repr(exc)`).
+
+    Concrete impact: pre-Fix-5 the alert string included `"{exc}"` which
+    embeds the FCMError message — and FCMError messages embed the FCM
+    topic + chained firebase exception (Chunk 3 P2.4 trace). Sending those
+    to Slack leaks operational state to a third-party SaaS."""
+    sent_alerts: list[str] = []
+    monkeypatch.setattr(cron, "send_alert", lambda msg: sent_alerts.append(msg))
+
+    today = date.today()
+    db.add(_fact(scheduled_date=today, external_id="ex-today"))
+    db.commit()
+
+    mock_fcm["message_id"] = fcm.FCMError(
+        "FCM send failed (topic='daily-fact', title='HistoryBites'): "
+        "UnregisteredError: Requested entity was not found."
+    )
+
+    rc = cron._main(["app.cron", "run_push"])
+    assert rc == 1
+    assert len(sent_alerts) == 1
+    msg = sent_alerts[0]
+
+    # Type name + sentinel are present
+    assert "FCMError" in msg
+    assert "see Railway logs" in msg
+
+    # Concrete leak strings must NOT reach Slack
+    assert "daily-fact" not in msg
+    assert "UnregisteredError" not in msg
+    assert "Requested entity" not in msg
+
+
 def test_cli_run_generation_returns_0(
     monkeypatch, mock_wikipedia, mock_provider, mock_alert
 ):
