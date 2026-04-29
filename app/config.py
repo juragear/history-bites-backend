@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     # Set on Railway via `railway variables --set ADMIN_TOKEN=...`.
     ADMIN_TOKEN: str
 
+    # Code Review Fix 6 (2026-04-29): browser auth on /admin/review now flows
+    # through an HttpOnly session cookie set by /admin/login (replacing the
+    # ?token=... query path). Programmatic auth keeps using Bearer headers.
+    # Cookie name is opaque on purpose. ADMIN_COOKIE_SECURE=False is needed
+    # only for local HTTP dev; production stays True so browsers refuse to
+    # send the cookie over plain HTTP.
+    ADMIN_COOKIE_NAME: str = "hb_admin"
+    ADMIN_COOKIE_SECURE: bool = True
+    ADMIN_COOKIE_MAX_AGE_SECONDS: int = 60 * 60 * 24 * 30  # 30 days
+
     # Firebase Cloud Messaging (Step 9, D17 + D22).
     # FIREBASE_SERVICE_ACCOUNT_JSON is the entire service account JSON file
     # contents as a single string — required, no safe default. The app fails

@@ -86,7 +86,7 @@ def test_openapi_declares_realistic_non_2xx_responses():
         ("/v1/today", "get"): {"200", "404"},
         ("/v1/archive", "get"): {"200"},
         ("/v1/health", "get"): {"200", "503"},
-        # Admin (401 inherited from router-level dependency)
+        # Admin (401 inherited from router-level dependency on `admin_router`)
         ("/admin/generate", "post"): {"200", "401", "503"},
         (
             "/admin/schedule/{pool_id}/{target_date}",
@@ -97,7 +97,15 @@ def test_openapi_declares_realistic_non_2xx_responses():
         ("/admin/push", "post"): {"200", "401", "400", "503"},
         ("/admin/cron/run-generation", "post"): {"200", "401", "503"},
         ("/admin/cron/status", "get"): {"200", "401", "503"},
-        ("/admin/review", "get"): {"200", "401"},
+        ("/admin/logout", "post"): {"303", "401"},
+        # Code Review Fix 6: /admin/review redirects to /admin/login on
+        # missing auth (303) instead of 401'ing — declared explicitly on the
+        # route, not inherited. /admin/login GET + POST live on the
+        # `admin_unauth_router` (no router-level auth dep), so their
+        # response codes come from the per-route declarations.
+        ("/admin/review", "get"): {"200", "303"},
+        ("/admin/login", "get"): {"200", "303"},
+        ("/admin/login", "post"): {"303", "401"},
     }
 
     missing: list[str] = []

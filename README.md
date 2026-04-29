@@ -57,6 +57,10 @@ pip install -e ".[dev]"
 cp .env.example .env
 # Fill in DATABASE_URL, WIKIPEDIA_USER_AGENT, GEMINI_API_KEY,
 # FIREBASE_SERVICE_ACCOUNT_JSON, ADMIN_TOKEN at minimum.
+#
+# For local HTTP dev, also set ADMIN_COOKIE_SECURE=false so the browser
+# accepts the /admin/login session cookie over plain http://. Production
+# stays true so the cookie is HTTPS-only.
 
 alembic upgrade head
 ```
@@ -127,6 +131,9 @@ import and crashes loudly if a required var is missing.
 | `OLLAMA_MODEL` | no | `gemma4:latest` | |
 | `PROMPT_VERSION` | no | `v1` | Stored on every generated fact. Bump and `/admin/flush-pool` after prompt edits. |
 | `ADMIN_TOKEN` | **yes** | — | Bearer token for `/admin/*`. App refuses to boot without it. |
+| `ADMIN_COOKIE_NAME` | no | `hb_admin` | Session cookie name set by `/admin/login` (Fix 6). Opaque label by design. |
+| `ADMIN_COOKIE_SECURE` | no | `true` | Cookie's `Secure` attribute. Set `false` only for local HTTP dev. |
+| `ADMIN_COOKIE_MAX_AGE_SECONDS` | no | `2592000` | Cookie lifetime (default 30 days). |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | **yes** | — | Full service-account JSON as a single-line string. |
 | `FCM_TOPIC` | no | `daily-fact` | Topic the daily push lands on. See **D17**. |
 | `ALERT_WEBHOOK_URL` | no | (unset) | Slack/Discord-compatible webhook for cron alerts. |
@@ -161,15 +168,37 @@ unversioned at `/admin/*`. OpenAPI spec at `/openapi.json` declares realistic
   `/admin/cron/status` so they're not exposed to unauthenticated callers.
   Returns 503 if the DB probe fails.
 
-### Admin endpoints (`/admin/*`, Bearer auth)
+### Admin endpoints (`/admin/*`)
 
-Auth posture (Code Review Fix 1): the strict default is
-`Authorization: Bearer $ADMIN_TOKEN` header **or** a hidden `token` form
-field. The `?token=...` query string is **rejected** on every admin endpoint
-EXCEPT `GET /admin/review` (the HTML review page, where browser navigations
-can't set Authorization headers). `StripQueryStringFormatter` (Fix 1 P2.2)
-strips `?token=...` from the uvicorn access log so even the one
-query-string-friendly path doesn't persist tokens to log retention.
+Auth posture (Code Review Fix 6, supersedes Fix 1's two-dep split): a single
+`verify_admin_token` dep accepts the token from one of three sources, in
+this order:
+
+1. **`Authorization: Bearer $ADMIN_TOKEN` header** — curl, scripts, the
+   Phase 2 mobile client.
+2. **`hb_admin` session cookie** — set by `POST /admin/login` (HttpOnly,
+   Secure, SameSite=Strict, Path=/admin, 30-day Max-Age). Browsers carry
+   this on every `/admin/*` request after login.
+3. **Hidden `token` form field** — the in-page rating-submit POSTs accept
+   it as a fallback to the cookie.
+
+The `?token=...` query string is **rejected on every route** — Fix 6
+removed the Fix 1 exception for `GET /admin/review`. Browsers without a
+valid cookie are 303-redirected to `GET /admin/login` (a minimal HTML
+form); programmatic POSTs without creds get a JSON 401.
+`StripQueryStringFormatter` (Fix 1 P2.2) is kept on the uvicorn access
+logger as defense in depth.
+
+- `GET /admin/login` — minimal HTML login form. Renders the form when
+  no valid cookie is present, 303s to `/admin/review` when a valid cookie
+  is already set. No auth required (it's the entry point).
+- `POST /admin/login` — validates the submitted `token` form field. On
+  success: 303 to `/admin/review` + `Set-Cookie: hb_admin=...`. On
+  failure: 401 + the form re-rendered with an error banner. Logs login
+  attempts at INFO with `outcome: success | failure` (the submitted token
+  value is never logged).
+- `POST /admin/logout` — clears the `hb_admin` cookie + 303s to
+  `/admin/login`. Auth required.
 
 - `POST /admin/generate` — force one pool generation cycle (one Wikipedia
   category → one fact via Gemini → one pool row). Returns 503 with a
@@ -184,9 +213,9 @@ query-string-friendly path doesn't persist tokens to log retention.
 - `POST /admin/retract/{target_date}` — set `is_retracted=TRUE` on the fact
   for that date. "No new views," not recall — see **D21d**. Returns 404 if
   no active fact exists for the date.
-- `GET /admin/review` — Jinja-rendered HTML review queue. The one route
-  that accepts `?token=...` (browsers can't set Authorization on plain
-  navigations).
+- `GET /admin/review` — Jinja-rendered HTML review queue. Cookie or
+  Bearer header required; without either, 303s to `/admin/login`. (Fix 6
+  removed the `?token=...` query-string entry that Fix 1 left in place.)
 - `POST /admin/review/{pool_id}` — rate a pool row (D26: 5-point Likert,
   `>=4` → approved, `<=3` → rejected). Body: `{rating: int, tags: [str],
   notes: str}` JSON, or form-encoded equivalent (HTML page uses 303

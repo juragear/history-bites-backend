@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app import wikipedia
 from app.admin import (
-    review_page_router as admin_review_page_router,
+    admin_unauth_router,
     router as admin_router,
 )
 from app.config import settings
@@ -173,10 +173,11 @@ app.add_middleware(
 )
 
 app.include_router(admin_router)
-# Code Review Fix 1 (P2.1): the GET /admin/review HTML page lives on a
-# separate sub-router with the query-friendly auth dependency. Every other
-# admin endpoint stays on the strict main router.
-app.include_router(admin_review_page_router)
+# Code Review Fix 6 (2026-04-29; replaces Fix 1's `admin_review_page_router`):
+# routes that handle their own auth (GET /admin/review redirects to login on
+# miss; GET + POST /admin/login bootstrap the session cookie). Everything
+# auth-required stays on `admin_router` above.
+app.include_router(admin_unauth_router)
 
 
 # Code Review Fix 4 (P2.1): public endpoints live on a versioned router.

@@ -295,7 +295,6 @@
           <a href="{{ row.source_url }}" target="_blank" rel="noopener noreferrer">{{ row.source_url }}</a>
         </div>
         <form method="post" action="/admin/review/{{ row.id }}" class="review-form">
-          <input type="hidden" name="token" value="{{ admin_token }}">
           <input type="hidden" name="rating" class="rating-value" value="{{ row.review_rating or '' }}">
 
           <div class="tag-section">
@@ -349,6 +348,10 @@
       </div>
     {% endfor %}
   {% endif %}
+
+  <form method="post" action="/admin/logout" style="margin:32px 0 0;">
+    <button type="submit" class="btn" style="background:#fff;">Log out</button>
+  </form>
 
   <script>
     // Step 13c — 5-circle rating selector + tag pill toggle + char counter +

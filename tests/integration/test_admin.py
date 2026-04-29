@@ -32,6 +32,15 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _cookie(token: str) -> dict[str, str]:
+    """Code Review Fix 6: build the cookie jar entry the browser would send
+    after a successful /admin/login. Tests that exercise the cookie auth
+    path pass this via `cookies=` on the TestClient request."""
+    from app.config import settings
+
+    return {settings.ADMIN_COOKIE_NAME: token}
+
+
 def _fact(
     *,
     scheduled_date: date,
@@ -107,22 +116,23 @@ def test_auth_post_rejects_query_param_on_admin_generate(
     assert resp.status_code == 401
 
 
-def test_auth_review_get_accepts_query_param(client, admin_token):
-    """Code Review Fix 1 (P2.1): the GET /admin/review HTML page IS allowed to
-    accept ?token=... — browser navigations can't set Authorization headers, and
-    `StripQueryStringFormatter` ensures the token doesn't survive into access
-    logs. This is the one route in the codebase where query-string auth is OK."""
-    resp = client.get(f"/admin/review?token={admin_token}")
-    # 200 (page renders) is the success signal. We're testing auth, not content.
-    assert resp.status_code == 200, (
-        f"GET /admin/review with ?token=... should authenticate; got {resp.status_code}"
+def test_auth_review_get_rejects_query_param(client, admin_token):
+    """Code Review Fix 6 (2026-04-29) regression: the Fix 1 ?token=... entry
+    point on GET /admin/review is removed. Query-string tokens are silently
+    ignored; the route 303s to /admin/login when there's no valid header or
+    cookie. This closes the Chunk 1 P2.2 carryover surface (URL bar / browser
+    history / bookmarks / screenshots)."""
+    resp = client.get(
+        f"/admin/review?token={admin_token}", follow_redirects=False
     )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/login"
 
 
 def test_auth_review_get_accepts_bearer_header(client, admin_token):
-    """The GET review page also accepts the Bearer header, even though most
-    browsers can't set it on plain navigations — curl / Postman / future API
-    clients exercise this path."""
+    """The GET review page accepts the Bearer header — curl / Postman / Phase
+    2 mobile clients exercise this path. Browser navigations land via the
+    cookie path (covered separately under Fix 6 cookie-auth tests)."""
     resp = client.get("/admin/review", headers=_bearer(admin_token))
     assert resp.status_code == 200
 
@@ -164,6 +174,184 @@ def test_auth_rejects_non_bearer_scheme(client, admin_token):
         "/admin/flush-pool", headers={"Authorization": f"Token {admin_token}"}
     )
     assert resp.status_code == 401
+
+
+# --- Code Review Fix 6 (2026-04-29) — cookie-based admin handoff -----------
+#
+# Replaces the Fix 1 ?token=... query-string entry on GET /admin/review with
+# a dedicated /admin/login form + HttpOnly session cookie. Bearer-header
+# auth on programmatic clients is unchanged. Tests below cover: login form
+# rendering, login POST success/failure, cookie-only auth on /admin/review
+# and admin POSTs, the friendly 303-to-login on /admin/review-without-creds,
+# the hard-401 retained on POSTs-without-creds, query-string regression,
+# logout cookie clearing, logout auth requirement, and log scrubbing.
+
+
+def test_admin_login_get_renders_form(client):
+    """GET /admin/login renders an HTML form with a password input + submit
+    + Cache-Control: no-store. No auth required (it's the entry point)."""
+    resp = client.get("/admin/login", follow_redirects=False)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers.get("cache-control") == "no-store"
+    body = resp.text
+    assert 'action="/admin/login"' in body
+    assert 'method="POST"' in body or 'method="post"' in body
+    assert 'name="token"' in body
+    assert 'type="password"' in body
+
+
+def test_admin_login_get_redirects_when_logged_in(client, admin_token):
+    """If the operator hits /admin/login with a valid cookie already set,
+    skip the form and redirect to /admin/review."""
+    resp = client.get(
+        "/admin/login",
+        cookies=_cookie(admin_token),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/review"
+
+
+def test_admin_login_post_success_sets_cookie_and_redirects(
+    client, admin_token
+):
+    """POST /admin/login with a valid token -> 303 to /admin/review and
+    Set-Cookie with the configured attributes (HttpOnly, Path=/admin,
+    Max-Age=2592000, SameSite=Strict, name from settings)."""
+    from app.config import settings
+
+    resp = client.post(
+        "/admin/login",
+        data={"token": admin_token},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/review"
+
+    set_cookie = resp.headers.get("set-cookie", "")
+    assert f"{settings.ADMIN_COOKIE_NAME}=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Path=/admin" in set_cookie
+    assert "SameSite=strict" in set_cookie or "SameSite=Strict" in set_cookie
+    assert f"Max-Age={settings.ADMIN_COOKIE_MAX_AGE_SECONDS}" in set_cookie
+
+
+def test_admin_login_post_failure_returns_401_with_form(client):
+    """POST /admin/login with a wrong token -> 401 + form re-rendered with
+    error banner. No Set-Cookie. Response is HTML (matches the GET shape)
+    so the operator stays on a usable page and can retry."""
+    resp = client.post(
+        "/admin/login",
+        data={"token": "this-is-not-the-token"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 401
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "set-cookie" not in {k.lower() for k in resp.headers.keys()}
+    body = resp.text
+    assert 'action="/admin/login"' in body
+    assert "Invalid token" in body
+
+
+def test_cookie_satisfies_auth_on_post_route(client, admin_token, db):
+    """The session cookie is enough to authenticate an admin POST — no
+    Bearer header, no form `token` field, just the cookie. Confirms the
+    Fix 6 dep collapse really did add cookie as a valid source."""
+    resp = client.post(
+        "/admin/flush-pool", cookies=_cookie(admin_token)
+    )
+    assert resp.status_code == 200
+
+
+def test_cookie_satisfies_auth_on_review_get(client, admin_token):
+    """Browser path: cookie set after login, subsequent GET /admin/review
+    renders the page (no header, no query)."""
+    resp = client.get(
+        "/admin/review", cookies=_cookie(admin_token), follow_redirects=False
+    )
+    assert resp.status_code == 200
+
+
+def test_no_auth_get_review_redirects_to_login(client):
+    """GET /admin/review with no header / no cookie / no form -> 303 to
+    /admin/login. The Fix 6 friendly-redirect: a fresh browser visitor
+    sees the login form, not a JSON 401."""
+    resp = client.get("/admin/review", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/login"
+
+
+def test_no_auth_post_returns_401(client):
+    """POST routes still 401-hard with no creds. Only /admin/review GET
+    does the friendly redirect — POSTs (likely scripts/curl) get the
+    machine-readable 401."""
+    resp = client.post("/admin/flush-pool")
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "missing admin token"
+
+
+def test_logout_clears_cookie_and_redirects(client, admin_token):
+    """POST /admin/logout with a valid cookie -> 303 to /admin/login and
+    Set-Cookie with Max-Age=0 (or expired Expires). A subsequent GET
+    /admin/review WITHOUT resetting the cookie 303s to login again."""
+    from app.config import settings
+
+    resp = client.post(
+        "/admin/logout", cookies=_cookie(admin_token), follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/login"
+
+    set_cookie = resp.headers.get("set-cookie", "")
+    assert f"{settings.ADMIN_COOKIE_NAME}=" in set_cookie
+    # Browsers treat Max-Age=0 OR an expired Expires as deletion.
+    assert "Max-Age=0" in set_cookie or "1970" in set_cookie
+
+
+def test_logout_requires_auth(client):
+    """POST /admin/logout with no creds -> 401. Logout is auth-required
+    (you must be logged in to log out — belt-and-braces over SameSite=Strict
+    CSRF defense)."""
+    resp = client.post("/admin/logout")
+    assert resp.status_code == 401
+
+
+def test_login_failure_logs_at_info_without_token(client, caplog):
+    """Failed login attempts log at INFO with `outcome: failure` in extras
+    and the submitted token value NEVER appears in the record. Token
+    discipline carry-over from Fix 5 Triage 0."""
+    import logging
+
+    submitted = "definitely-not-the-real-token-xyz123"
+
+    caplog.set_level(logging.INFO, logger="app.admin")
+    resp = client.post(
+        "/admin/login", data={"token": submitted}, follow_redirects=False
+    )
+    assert resp.status_code == 401
+
+    login_records = [
+        r for r in caplog.records if r.getMessage() == "admin login"
+    ]
+    assert len(login_records) >= 1
+    failure_records = [
+        r
+        for r in login_records
+        if getattr(r, "extra", {}).get("outcome") == "failure"
+    ]
+    assert len(failure_records) >= 1, (
+        "Expected at least one INFO record with outcome=failure"
+    )
+    assert failure_records[0].levelname == "INFO"
+
+    # Belt-and-braces: scan every log record from this attempt for the
+    # submitted token string. It must NOT appear anywhere — message, args,
+    # extras, or formatted output.
+    for record in caplog.records:
+        assert submitted not in record.getMessage()
+        assert submitted not in str(getattr(record, "extra", ""))
+        assert submitted not in str(record.args or "")
 
 
 # --- /admin/generate --------------------------------------------------------
@@ -455,7 +643,12 @@ def test_admin_review_form_rating_returns_303_redirect(
     client, admin_token, db
 ):
     """Form-encoded rating submit -> 303 back to /admin/review (HTML page
-    shape; prevents browser re-POST on refresh)."""
+    shape; prevents browser re-POST on refresh).
+
+    Code Review Fix 6: redirect target is now the bare `/admin/review` (the
+    cookie carries auth on the follow-up GET). Pre-Fix-6 redirect was
+    `/admin/review?token=<value>` which leaked the token back into the URL
+    bar after every form submit."""
     db.add(_pool(external_id="p1"))
     db.commit()
     pool_id = db.query(PoolFact).first().id
@@ -466,7 +659,7 @@ def test_admin_review_form_rating_returns_303_redirect(
         follow_redirects=False,
     )
     assert resp.status_code == 303
-    assert "/admin/review" in resp.headers["location"]
+    assert resp.headers["location"] == "/admin/review"
 
     db.expire_all()
     row = db.get(PoolFact, pool_id)

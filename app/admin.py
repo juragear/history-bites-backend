@@ -1,24 +1,33 @@
-"""Admin endpoints + review HTML page (Step 8; auth split per Code Review
-Fix 1).
+"""Admin endpoints + review HTML page (Step 8; cookie handoff per Code
+Review Fix 6, 2026-04-29).
 
-Bearer-token auth on every route. **Two** auth dependencies:
+Two authentication channels, one shared verification dep:
 
-  - `verify_admin_token_strict` — accepts the token from `Authorization:
-    Bearer <token>` header OR a hidden `token` form field. The default for
-    every admin route. Query-string tokens are NOT accepted because
-    query-string secrets land in access logs / proxy logs / browser history.
+  - **Bearer header** — `Authorization: Bearer <token>` for curl, scripts,
+    and the Phase 2 mobile client. Unchanged from Fix 1.
+  - **Session cookie** — `hb_admin` HttpOnly + Secure + SameSite=Strict +
+    Path=/admin, set by POST `/admin/login` after the operator submits the
+    token via a form, cleared by POST `/admin/logout`. Replaces the
+    `?token=...` query string that GET `/admin/review` accepted in Fix 1.
 
-  - `verify_admin_token_with_query` — additionally accepts `?token=...` in
-    the URL. Used ONLY on the GET `/admin/review` HTML page, where browser
-    navigations can't set Authorization headers. The query-string surface is
-    isolated to this one read-only HTML route via a separate sub-router
-    (`review_page_router`) so a future POST endpoint added to the main
-    `router` automatically inherits the strict posture.
+The single `verify_admin_token` dependency reads (header | cookie | form),
+in that order. Query-string tokens are NOT accepted on any route — Fix 6
+removes that surface entirely so URL bars, browser history, bookmarks, and
+screenshots cannot leak the token.
 
-Code Review Fix 1 (P2.1 + P2.2): paired with `StripQueryStringFormatter` in
-`app/main.py:configure_logging` which strips `?...` from uvicorn access-log
-request lines. Together: query-string tokens are accepted on exactly one
-HTTP route AND never persisted to logs, even on that route.
+Two routers reflect the two auth postures:
+
+  - `router` (the main admin router) — applies `verify_admin_token` at the
+    router level. Every POST + the operator GETs (`/admin/cron/status`,
+    `/admin/logout`) auto-401 on missing/invalid creds.
+  - `admin_unauth_router` — has no router-level dep. Hosts the three routes
+    that handle their own auth so they can render or redirect instead of
+    401'ing: GET `/admin/review` (redirects to /admin/login on miss), GET
+    `/admin/login` (renders form), POST `/admin/login` (validates + sets
+    cookie). Replaces the Fix 1 `review_page_router` sub-router.
+
+`StripQueryStringFormatter` in `app/main.py:configure_logging` is kept as
+defense in depth even though no admin route now reads query-string tokens.
 
 D21d note: /admin/retract is no-new-views, NOT recall. The response body
 explicitly says so — Will needs to remember that pushing retract doesn't
@@ -34,11 +43,11 @@ from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
+    Cookie,
     Depends,
     Form,
     HTTPException,
     Header,
-    Query,
     Request,
     Response,
     status,
@@ -72,38 +81,51 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 def _extract_token(
     authorization: str | None,
-    token_query: str | None,
+    token_cookie: str | None,
     token_form: str | None,
 ) -> str | None:
-    """Pull the candidate token from header OR query OR form, in that order.
+    """Pull the candidate token from header > cookie > form, in that order.
 
-    Header form: `Authorization: Bearer <token>`. We only accept the literal
-    "Bearer" scheme — case-sensitive — to avoid silently accepting weird
+    Header form: `Authorization: Bearer <token>`. Only the literal "Bearer"
+    scheme (case-sensitive) is accepted to avoid silently accepting weird
     variants. Anything malformed returns None and the caller raises 401.
 
-    Either of `token_query` / `token_form` may be passed as None to indicate
-    "this auth variant does not accept this source" (the strict variant
-    passes None for `token_query` so URL-based tokens are never even
-    considered).
+    The cookie source is the Fix 6 replacement for the Fix 1 `?token=...`
+    query path; the form source is unchanged (the HTML review page POSTs
+    rating submissions and either the cookie or a hidden token field can
+    authenticate them; SameSite=Strict on the cookie covers CSRF).
     """
     if authorization:
         parts = authorization.split()
         if len(parts) == 2 and parts[0] == "Bearer":
             return parts[1]
         return None
-    if token_query:
-        return token_query
+    if token_cookie:
+        return token_cookie
     if token_form:
         return token_form
     return None
 
 
+def _is_valid_token(candidate: str | None) -> bool:
+    """Non-raising constant-time check against settings.ADMIN_TOKEN.
+
+    Used by routes that handle the failure themselves (the /admin/login
+    "already logged in" redirect, the /admin/login POST validator, and the
+    /admin/review redirect-to-login fallback). `_check_token` wraps this for
+    the dependency path that wants a 401 raised.
+    """
+    if candidate is None:
+        return False
+    return secrets.compare_digest(candidate, settings.ADMIN_TOKEN)
+
+
 def _check_token(candidate: str | None) -> None:
     """Constant-time compare against settings.ADMIN_TOKEN. 401 on miss/bad.
 
-    Shared by both auth-dependency variants (strict + with-query). Centralised
-    so the comparison + 401 shape are identical regardless of which route
-    triggered the check.
+    Wraps `_is_valid_token` so the raising path and the boolean path stay in
+    sync. Used by `verify_admin_token` so the dependency machinery surfaces
+    the standard 401 shape on missing/invalid creds.
     """
     if candidate is None:
         raise HTTPException(
@@ -111,7 +133,7 @@ def _check_token(candidate: str | None) -> None:
             detail="missing admin token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not secrets.compare_digest(candidate, settings.ADMIN_TOKEN):
+    if not _is_valid_token(candidate):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid admin token",
@@ -119,52 +141,66 @@ def _check_token(candidate: str | None) -> None:
         )
 
 
-async def verify_admin_token_strict(
+def _set_admin_cookie(response: Response, token: str) -> None:
+    """Attach the admin session cookie to `response`.
+
+    HttpOnly stops JS readers; Secure stops the browser sending it over plain
+    HTTP (overrideable for local dev via `ADMIN_COOKIE_SECURE=False`);
+    SameSite=Strict stops cross-site auto-send (CSRF defense for the form
+    POSTs that previously relied on a hidden token field); Path=/admin
+    scopes the cookie to admin routes so it never reaches public paths.
+    """
+    response.set_cookie(
+        key=settings.ADMIN_COOKIE_NAME,
+        value=token,
+        max_age=settings.ADMIN_COOKIE_MAX_AGE_SECONDS,
+        path="/admin",
+        secure=settings.ADMIN_COOKIE_SECURE,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _clear_admin_cookie(response: Response) -> None:
+    """Drop the admin session cookie via Set-Cookie with Max-Age=0.
+
+    Browsers match cookies on (name, path, domain) for deletion. The
+    attributes here MUST mirror `_set_admin_cookie` or the original cookie
+    persists in the browser's jar.
+    """
+    response.delete_cookie(
+        key=settings.ADMIN_COOKIE_NAME,
+        path="/admin",
+        secure=settings.ADMIN_COOKIE_SECURE,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+async def verify_admin_token(
     authorization: Annotated[str | None, Header()] = None,
+    cookie_token: Annotated[
+        str | None, Cookie(alias=settings.ADMIN_COOKIE_NAME)
+    ] = None,
     token_form: Annotated[str | None, Form(alias="token")] = None,
 ) -> None:
-    """Default admin auth: accepts header or form ONLY — not query string.
+    """Unified admin auth: accepts header, cookie, or form (in that order).
 
-    Used on every admin endpoint EXCEPT the GET `/admin/review` HTML page
-    (which uses `verify_admin_token_with_query` because browser navigations
-    can't set Authorization headers). Query-string tokens are rejected here
-    because they end up in access logs, proxy logs, browser history, and
-    Referer headers — defense-in-depth complementing
-    `app/main.py:StripQueryStringFormatter`.
+    Code Review Fix 6 collapsed the Fix 1 strict + with-query split back to
+    a single dependency. The cookie path replaces the `?token=...` query
+    path; query-string tokens are no longer accepted on any route.
     """
-    candidate = _extract_token(authorization, token_query=None, token_form=token_form)
-    _check_token(candidate)
+    _check_token(_extract_token(authorization, cookie_token, token_form))
 
 
-async def verify_admin_token_with_query(
-    authorization: Annotated[str | None, Header()] = None,
-    token: Annotated[str | None, Query()] = None,
-    token_form: Annotated[str | None, Form(alias="token")] = None,
-) -> None:
-    """Admin auth that ADDITIONALLY accepts `?token=...` in the URL.
-
-    Use ONLY on the GET `/admin/review` HTML page. Browsers can't set
-    Authorization headers on a plain navigation, and a hidden form field
-    can't be embedded in a navigation either, so the query-string path is
-    the only practical option for that one route. The
-    `StripQueryStringFormatter` in `app/main.py` ensures the token still
-    doesn't land in access logs even when used via this path.
-    """
-    candidate = _extract_token(authorization, token_query=token, token_form=token_form)
-    _check_token(candidate)
-
-
-# Main admin router — strict auth (no query-string token). Every admin POST
-# endpoint registered against this router automatically inherits the strict
-# posture. New endpoints get strict auth for free.
-#
-# Code Review Fix 4 (P2.2): the router-level `responses=` declares the 401
-# shape that the auth dependency raises on missing/invalid tokens. Every
-# endpoint inherits this, so OpenAPI consumers see the 401 surface
-# consistently across all admin routes without per-endpoint repetition.
+# Main admin router — auto-401s on missing/invalid creds via the unified
+# `verify_admin_token` dep applied at the router level. Every POST plus
+# operator GETs (cron/status, logout) inherit this. Code Review Fix 4 (P2.2)
+# declared the 401 response shape here for OpenAPI consistency; that
+# carries over through the Fix 6 dep collapse unchanged.
 router = APIRouter(
     prefix="/admin",
-    dependencies=[Depends(verify_admin_token_strict)],
+    dependencies=[Depends(verify_admin_token)],
     responses={
         401: {
             "model": ErrorDetail,
@@ -173,20 +209,14 @@ router = APIRouter(
     },
 )
 
-# Separate sub-router for the GET /admin/review HTML page only. Isolating
-# the query-friendly auth posture to this one router means it can't bleed
-# into other endpoints by accident — a future POST added to `router` above
-# is naturally strict; only GETs explicitly registered HERE accept ?token=.
-review_page_router = APIRouter(
-    prefix="/admin",
-    dependencies=[Depends(verify_admin_token_with_query)],
-    responses={
-        401: {
-            "model": ErrorDetail,
-            "description": "Missing or invalid admin token.",
-        },
-    },
-)
+# Code Review Fix 6 (replaces Fix 1's `review_page_router`): hosts the three
+# routes that manage their own auth — /admin/login GET (renders form),
+# /admin/login POST (validates and sets cookie), /admin/review GET
+# (redirects to /admin/login on miss instead of 401'ing). No router-level
+# dep so the handlers can choose between rendering, redirecting, and
+# 401'ing per-route. Every other admin endpoint stays on `router` with
+# auto-401 enforcement.
+admin_unauth_router = APIRouter(prefix="/admin")
 
 
 # --- response models ---------------------------------------------------------
@@ -718,8 +748,12 @@ async def admin_review(
         ) from exc
 
     if is_form:
+        # Code Review Fix 6: redirect to the bare path. The browser carries
+        # the admin session cookie automatically on the follow-up GET, so
+        # the previous `?token=...` round-trip (which leaked the token into
+        # the URL bar after every form submit) is no longer needed.
         return RedirectResponse(
-            url=f"/admin/review?token={settings.ADMIN_TOKEN}",
+            url="/admin/review",
             status_code=status.HTTP_303_SEE_OTHER,
         )
     return ReviewActionResponse(
@@ -943,23 +977,38 @@ def admin_cron_status(response: Response) -> CronStatusResponse:
     )
 
 
-@review_page_router.get(
+@admin_unauth_router.get(
     "/review",
-    response_class=HTMLResponse,
     responses={
         200: {
             "description": "Renders the review queue HTML page.",
             "content": {"text/html": {}},
         },
+        303: {"description": "No valid auth — redirect to /admin/login."},
     },
 )
 def admin_review_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
-) -> HTMLResponse:
-    """Render the review queue. Auth is enforced by the router-level
-    dependency on `review_page_router`, which accepts ?token=... for
-    browser navigations (the only route in the codebase that does)."""
+    authorization: Annotated[str | None, Header()] = None,
+    cookie_token: Annotated[
+        str | None, Cookie(alias=settings.ADMIN_COOKIE_NAME)
+    ] = None,
+) -> Response:
+    """Render the review queue, or redirect to /admin/login on no creds.
+
+    Code Review Fix 6: this is the only admin route that does manual auth
+    instead of inheriting the router-level dep — POST routes 401-hard,
+    /admin/review GET 303s to the login form so a browser visitor with no
+    cookie sees a usable page instead of a JSON 401. Header auth still
+    works for curl + scripts (no behaviour change for programmatic
+    callers).
+    """
+    if not _is_valid_token(_extract_token(authorization, cookie_token, None)):
+        return RedirectResponse(
+            url="/admin/login", status_code=status.HTTP_303_SEE_OTHER
+        )
+
     pending = list(
         db.execute(
             select(PoolFact)
@@ -978,6 +1027,9 @@ def admin_review_page(
         .where(PoolFact.status == "rejected")
     ).scalar_one()
 
+    # Code Review Fix 6: `admin_token` is no longer passed to the template.
+    # The hidden form field that previously embedded the token was removed
+    # from `review.html`; cookie auth covers the form POSTs.
     return templates.TemplateResponse(
         request=request,
         name="review.html",
@@ -986,6 +1038,140 @@ def admin_review_page(
             "pending_count": len(pending),
             "approved_count": approved_count,
             "rejected_count": rejected_count,
-            "admin_token": settings.ADMIN_TOKEN,
         },
     )
+
+
+# --- /admin/login + /admin/logout (Code Review Fix 6, 2026-04-29) -----------
+#
+# Browser auth flows through these three routes. The login form is
+# intentionally minimal — operator-only, one-shot per cookie lifetime, no
+# brand. Inline HTML keeps it out of the Jinja templates directory; the
+# template surface stays scoped to user-facing review markup.
+
+
+def _render_login_form(error: str | None = None) -> str:
+    """Render the /admin/login HTML form.
+
+    Plain semantic markup — no CSS framework, no JS, no external assets. The
+    only conditional element is an error banner shown after a failed POST.
+    """
+    error_html = (
+        f'<p style="color:#b3261e;margin:8px 0;">{error}</p>' if error else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>HistoryBites Admin Login</title>
+</head>
+<body style="font:16px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;max-width:360px;margin:48px auto;padding:0 16px;">
+  <h1 style="font-size:20px;margin:0 0 16px;">HistoryBites Admin</h1>
+  {error_html}
+  <form method="POST" action="/admin/login">
+    <label style="display:block;font-size:14px;margin-bottom:8px;">Admin token
+      <input type="password" name="token" autofocus required
+             style="display:block;width:100%;padding:8px;font:inherit;
+                    border:1px solid #ddd;border-radius:6px;margin-top:4px;">
+    </label>
+    <button type="submit"
+            style="display:block;width:100%;padding:10px 16px;font:inherit;
+                   background:#0b5fff;color:#fff;border:1px solid #0b5fff;
+                   border-radius:6px;cursor:pointer;margin-top:12px;">
+      Sign in
+    </button>
+  </form>
+</body>
+</html>"""
+
+
+@admin_unauth_router.get(
+    "/login",
+    responses={
+        200: {
+            "description": "Renders the admin login form.",
+            "content": {"text/html": {}},
+        },
+        303: {"description": "Already authenticated — redirect to /admin/review."},
+    },
+)
+def admin_login_page(
+    cookie_token: Annotated[
+        str | None, Cookie(alias=settings.ADMIN_COOKIE_NAME)
+    ] = None,
+) -> Response:
+    """Render the login form, or redirect to /admin/review if already logged in.
+
+    No auth dep on this route — it's the entry point for unauthenticated
+    operators. The "already logged in" check is done manually in the body so
+    a missing/invalid cookie falls through to render the form rather than
+    raising 401.
+    """
+    if _is_valid_token(cookie_token):
+        return RedirectResponse(
+            url="/admin/review", status_code=status.HTTP_303_SEE_OTHER
+        )
+    # Cache-Control: no-store keeps the form (and any post-failure error
+    # banner) out of browser/intermediary caches.
+    return HTMLResponse(
+        content=_render_login_form(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@admin_unauth_router.post(
+    "/login",
+    responses={
+        303: {"description": "Login OK — Set-Cookie + redirect to /admin/review."},
+        401: {
+            "description": "Bad token — re-render form with error.",
+            "content": {"text/html": {}},
+        },
+    },
+)
+def admin_login_submit(
+    token: Annotated[str | None, Form()] = None,
+) -> Response:
+    """Validate the submitted token and either set the cookie + redirect or
+    re-render the form with an error.
+
+    INFO log carries the outcome only; the submitted token value is NEVER
+    logged on either path. Failed attempts log at INFO (not WARNING) because
+    in single-operator pre-launch a fail is overwhelmingly an operator
+    typo, not an attack — Slack-noise discipline.
+    """
+    if _is_valid_token(token):
+        logger.info("admin login", extra={"extra": {"outcome": "success"}})
+        response = RedirectResponse(
+            url="/admin/review", status_code=status.HTTP_303_SEE_OTHER
+        )
+        # `token` is non-None here because _is_valid_token returned True.
+        _set_admin_cookie(response, token)  # type: ignore[arg-type]
+        return response
+
+    logger.info("admin login", extra={"extra": {"outcome": "failure"}})
+    return HTMLResponse(
+        content=_render_login_form(error="Invalid token"),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post(
+    "/logout",
+    responses={
+        303: {"description": "Logout — clear cookie + redirect to /admin/login."},
+    },
+)
+def admin_logout() -> Response:
+    """Clear the admin session cookie. Auth required (you must be logged in
+    to log out — SameSite=Strict already covers most CSRF risk; the auth
+    requirement is belt-and-braces).
+    """
+    response = RedirectResponse(
+        url="/admin/login", status_code=status.HTTP_303_SEE_OTHER
+    )
+    _clear_admin_cookie(response)
+    return response
