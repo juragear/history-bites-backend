@@ -56,7 +56,23 @@ class ArticleExtract:
 
 
 class WikipediaError(Exception):
-    """Generic Wikipedia client error (non-HTTP)."""
+    """Generic Wikipedia client error (non-HTTP).
+
+    Code Review Chunk 3 P3.5 / Chunk 5 P3.1: this parent is currently
+    raised once (at fetch_extract's empty-pages guard, see :282) and never
+    caught at its own type — `generate_one_pool_fact` catches
+    `WikipediaNotFound` (subclass) explicitly and the rest falls through
+    to a broad `except Exception`. Kept as a typed parent because:
+      1. `WikipediaNotFound(WikipediaError)` is a proper hierarchy; the
+         parent serves the documentation role of "non-HTTP Wikipedia
+         client error" even without a direct catch site.
+      2. Future code that wants to distinguish Wikipedia-specific failures
+         from arbitrary `Exception` (e.g., a hypothetical structured
+         retry-budget at the wikipedia layer) gets a typed handle for free.
+      3. Removing it would force `WikipediaNotFound` to subclass
+         `Exception` directly, weakening the typed boundary for a few
+         lines saved.
+    """
 
 
 class WikipediaNotFound(WikipediaError):

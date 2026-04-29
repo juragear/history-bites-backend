@@ -24,10 +24,22 @@ dependencies = [
 # `pip install -e .[dev]` is a self-contained "I want to run tests" install.
 # pytest-asyncio is needed because run_generation is async — tests that exercise
 # the topup loop need @pytest.mark.asyncio.
+#
+# Code Review Fix 5 (Chunk 5 P3.6): coverage / pytest-cov / pytest-randomly /
+# vulture are added so future audits can be quantitative. NOT enabled in CI
+# (no addopts wiring; no [tool.coverage] block) — run on demand via
+#   pytest --cov=app --cov-report=term-missing
+#   pytest -p randomly
+#   vulture app/
+# Major-pinned to avoid breaking-version surprises; minor floats freely.
 dev = [
     "pytest",
     "pytest-asyncio",
     "httpx",
+    "coverage>=7,<8",
+    "pytest-cov>=5,<7",
+    "pytest-randomly>=3,<4",
+    "vulture>=2,<3",
 ]
 
 [build-system]

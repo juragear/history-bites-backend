@@ -67,7 +67,8 @@ alembic upgrade head
 pytest -q
 ```
 
-The suite is 80 tests, runs in ~2.5s, hits no external services. See
+The suite is ~230 tests, runs in ~2s, hits no external services. (Approximate;
+run `pytest --collect-only -q | tail -1` to refresh the count.) See
 `tests/conftest.py` for the in-memory SQLite fixture wiring (StaticPool +
 shared connection + a few SQLite-vs-Postgres compile hooks; see
 **Troubleshooting**).
@@ -76,7 +77,7 @@ shared connection + a few SQLite-vs-Postgres compile hooks; see
 
 ```bash
 uvicorn app.main:app --reload
-# → http://127.0.0.1:8000/health
+# → http://127.0.0.1:8000/v1/health
 ```
 
 ## Deployment (Railway)
@@ -135,34 +136,75 @@ import and crashes loudly if a required var is missing.
 
 ## API Surface
 
-### Public endpoints
+Public endpoints live behind `/v1/` (Code Review Fix 4); admin endpoints stay
+unversioned at `/admin/*`. OpenAPI spec at `/openapi.json` declares realistic
+4xx/5xx responses for every route via the `ErrorDetail` envelope (Fix 4 P2.2).
 
-- `GET /today` — today's fact, or the most recent past fact with
-  `is_stale=true` if today's row is missing. Cached 5 min, keyed by ISO date
-  (auto-evicts at midnight per **D21c**), busted on schedule/retract.
-- `GET /archive?limit=30` — recent facts, newest first, retracted excluded.
-  `limit` is 1..100.
-- `GET /health` — `{ status, db, pool_pending_count, pool_approved_count,
-  latest_scheduled_date, last_push_at }`. Returns 503 if the DB probe fails.
+### Public endpoints (`/v1/*`)
 
-### Admin endpoints (Bearer auth)
+- `GET /v1/today` — today's fact, or the most recent past fact with
+  `is_stale=true` if today's row is missing. Cached 5 min in-memory keyed by
+  ISO date (auto-evicts at midnight per **D21c**), busted on schedule/retract.
+  Sets `Cache-Control: public, max-age=300` (Fix 4 P2.4) so dio (Flutter HTTP
+  client) and a future Cloudflare front share the same window. **404** when
+  no fact exists at all.
+- `GET /v1/archive?limit=30&before=2026-04-25` — cursor-paginated archive
+  (Fix 4 P2.5). `limit` is 1..100, default 30. `before` is the ISO date
+  cursor (open interval, `scheduled_date < before`). Response shape is
+  `{items: [...], next_before: <date|null>}`. `next_before` is null on the
+  final page; otherwise pass back as `?before=<value>` for the next page.
+  Retracted facts are excluded; ordering is `scheduled_date DESC` (stable
+  via the UNIQUE constraint on `facts.scheduled_date`).
+- `GET /v1/health` — public liveness probe (Fix 4 P2.3). Thin shape:
+  `{status: ok|degraded, db: ok|down}`. **No** operational metrics here —
+  pool counts, scheduling runway, and `last_push_at` moved to
+  `/admin/cron/status` so they're not exposed to unauthenticated callers.
+  Returns 503 if the DB probe fails.
 
-Auth: `Authorization: Bearer $ADMIN_TOKEN`, or `?token=...` query param, or
-hidden `token` form field (so the HTML review page can submit reviews).
+### Admin endpoints (`/admin/*`, Bearer auth)
 
-- `POST /admin/generate` — force one pool generation cycle.
+Auth posture (Code Review Fix 1): the strict default is
+`Authorization: Bearer $ADMIN_TOKEN` header **or** a hidden `token` form
+field. The `?token=...` query string is **rejected** on every admin endpoint
+EXCEPT `GET /admin/review` (the HTML review page, where browser navigations
+can't set Authorization headers). `StripQueryStringFormatter` (Fix 1 P2.2)
+strips `?token=...` from the uvicorn access log so even the one
+query-string-friendly path doesn't persist tokens to log retention.
+
+- `POST /admin/generate` — force one pool generation cycle (one Wikipedia
+  category → one fact via Gemini → one pool row). Returns 503 with a
+  scrubbed sentinel body on `GenerationFailed` (Fix 3 P2.3).
 - `POST /admin/flush-pool` — delete all `pending_review` rows. Use after
-  prompt changes.
-- `POST /admin/schedule/{pool_id}/{date}` — pin a specific approved pool item
-  to a specific date. Used during launch bootstrap (**D21d**).
-- `POST /admin/retract/{date}` — set `is_retracted=TRUE` on the fact for that
-  date. "No new views," not recall — see **D21d**.
-- `GET /admin/review` — Jinja-rendered HTML review page.
-- `POST /admin/review/{id}` — `{action: 'approve'|'reject'}` JSON, or
-  `action=...` form post (HTML page uses 303 redirect).
-- `POST /admin/push` — manually fire `run_push`.
-- `POST /admin/cron/run-generation` — manually fire `run_generation`. Returns
-  the same summary dict the cron logs.
+  prompt changes (D27 widened the unique constraint to include
+  `prompt_version` so v1 + v3 rows for the same article coexist).
+- `POST /admin/schedule/{pool_id}/{target_date}` — pin a specific approved
+  pool row to a specific date. Used during launch bootstrap (**D21d**).
+  Returns 404 if the pool row is gone, 400 if its status isn't `approved`,
+  409 if the date is already scheduled.
+- `POST /admin/retract/{target_date}` — set `is_retracted=TRUE` on the fact
+  for that date. "No new views," not recall — see **D21d**. Returns 404 if
+  no active fact exists for the date.
+- `GET /admin/review` — Jinja-rendered HTML review queue. The one route
+  that accepts `?token=...` (browsers can't set Authorization on plain
+  navigations).
+- `POST /admin/review/{pool_id}` — rate a pool row (D26: 5-point Likert,
+  `>=4` → approved, `<=3` → rejected). Body: `{rating: int, tags: [str],
+  notes: str}` JSON, or form-encoded equivalent (HTML page uses 303
+  redirect on form submit). 422 on missing/out-of-range rating; 404 if the
+  pool row doesn't exist.
+- `POST /admin/push` — manually fire `run_push` (sends today's fact to FCM
+  topic `daily-fact`). 400 if no fact is scheduled for today (or it's
+  retracted); 503 with a scrubbed sentinel body on `FCMError` (Fix 3 P2.4).
+- `POST /admin/cron/run-generation` — manually fire `run_generation` (cron
+  entry: schedule tomorrow + top up review queue + alert if approved is
+  low). Returns the same summary dict the scheduled cron logs. 503 with a
+  scrubbed sentinel body on any unhandled exception (Fix 3 P2.2).
+- `GET /admin/cron/status` — operator-facing operational view (Fix 4 P2.3).
+  Returns the rich shape pre-Fix-4 `/health` returned: `{status, db,
+  pool_pending_count, pool_approved_count, approved_status, latest_scheduled_date,
+  last_push_at}`. The D8 three-tier `approved_status` is `ok|warm|low|unknown`.
+  Gated by the standard admin auth so unauthenticated observers can't infer
+  pool size or cron timing.
 
 ## Cron
 

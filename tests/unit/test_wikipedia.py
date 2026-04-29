@@ -202,3 +202,77 @@ def test_get_json_emits_before_sleep_log_on_transient_5xx(monkeypatch, caplog):
         "Expected at least one before_sleep log entry on transient 5xx; "
         f"got {[r.getMessage() for r in caplog.records if r.name == 'app.wikipedia']}"
     )
+
+
+# --- Code Review Fix 5 (Chunk 5 P2.3): tenacity retry-EXHAUSTION ---------
+
+
+def test_get_json_retry_exhaustion_raises_httpx_status_error():
+    """Chunk 5 P2.3: when transient 5xx persists across all attempts, the
+    final exception must be `httpx.HTTPStatusError` (the underlying type) —
+    NOT `tenacity.RetryError`. The Wikipedia decorator uses `reraise=True`
+    for exactly this reason: `generate_one_pool_fact`'s candidate loop
+    catches `httpx.HTTPStatusError` explicitly to decide budget cost; if
+    `reraise=True` is ever dropped, callers would see `RetryError` instead
+    and fall through to the broad `except Exception` clause, silently
+    changing the budget-cost decision.
+
+    Also pins the attempt count: `stop_after_attempt(3)` means the
+    underlying `client.get` is invoked exactly 3 times (initial + 2
+    retries) before exhaustion.
+    """
+    import asyncio
+
+    import httpx
+    import tenacity
+
+    from app import wikipedia as wiki_module
+
+    call_count = {"n": 0}
+
+    class _AlwaysFailingResponse:
+        def __init__(self) -> None:
+            self.status_code = 503
+            self.request = httpx.Request("GET", "https://en.wikipedia.org/w/api.php")
+
+        def raise_for_status(self) -> None:
+            raise httpx.HTTPStatusError(
+                "HTTP 503",
+                request=self.request,
+                response=httpx.Response(503, request=self.request),
+            )
+
+        def json(self) -> dict:
+            return {}
+
+    class _AlwaysFailingClient:
+        async def get(self, url: str, params: dict | None = None):
+            call_count["n"] += 1
+            return _AlwaysFailingResponse()
+
+    import pytest
+
+    # Patch via the public wikipedia module attribute; mirrors the
+    # recovery-path test above.
+    wiki_module._get_client_orig = wiki_module._get_client
+    wiki_module._get_client = lambda: _AlwaysFailingClient()
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            asyncio.run(
+                wiki_module._get_json("https://en.wikipedia.org/w/api.php")
+            )
+
+        # The underlying type bubbles up — NOT tenacity.RetryError
+        assert exc_info.value.response.status_code == 503
+        assert not isinstance(exc_info.value, tenacity.RetryError)
+
+        # 3 attempts total per `stop_after_attempt(3)` in app/wikipedia.py.
+        # Hardcoded here because pulling the constant out of the @retry
+        # decorator at runtime is awkward; if the decorator's stop= count
+        # changes, this test will fail and force the change to be deliberate.
+        assert call_count["n"] == 3, (
+            f"Expected 3 attempts (stop_after_attempt(3)); got {call_count['n']}"
+        )
+    finally:
+        wiki_module._get_client = wiki_module._get_client_orig
+        del wiki_module._get_client_orig

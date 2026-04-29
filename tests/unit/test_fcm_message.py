@@ -89,3 +89,98 @@ def test_build_message_uses_topic_not_token():
     )
     assert msg.topic == "daily-fact"
     assert msg.token is None
+
+
+# --- Code Review Fix 5 (Chunk 5 P2.3): tenacity retry-EXHAUSTION ---------
+
+
+def test_send_with_retry_exhaustion_raises_underlying_transient_error(monkeypatch):
+    """Chunk 5 P2.3: when a transient firebase exception persists across
+    all attempts, the final exception must be the underlying type — NOT
+    `tenacity.RetryError`. The FCM decorator uses `reraise=True` for
+    exactly this reason: `send_to_topic`'s outer `except Exception:`
+    wraps the underlying exception into `FCMError(...)`; if `reraise=True`
+    is ever dropped, callers would see `tenacity.RetryError` wrapped into
+    `FCMError`, with the underlying cause one level deeper than the
+    Chunk 3 audit traced.
+
+    Also pins the attempt count: `stop_after_attempt(3)` means the
+    underlying `messaging.send` is invoked exactly 3 times (initial + 2
+    retries) before exhaustion.
+
+    Synthetic transient exception: `_is_transient` matches by class name
+    (\"UnavailableError\", \"DeadlineExceededError\", etc.) so a stub class
+    with the matching `__name__` exercises the same predicate path as a
+    real firebase-admin exception, without depending on importing
+    firebase-admin's exception hierarchy.
+    """
+    import tenacity
+
+    from app import fcm as fcm_module
+
+    # Synthetic exception whose class name matches one of `_is_transient`'s
+    # transient_names entries (so the predicate returns True).
+    class UnavailableError(Exception):
+        pass
+
+    call_count = {"n": 0}
+
+    def _always_unavailable(message, app=None):
+        call_count["n"] += 1
+        raise UnavailableError("simulated sustained FCM outage")
+
+    monkeypatch.setattr(fcm_module.messaging, "send", _always_unavailable)
+
+    fake_message = object()  # _send_with_retry passes through to messaging.send
+    fake_app = object()
+
+    import pytest
+
+    with pytest.raises(UnavailableError) as exc_info:
+        fcm_module._send_with_retry(fake_message, fake_app)
+
+    # The underlying type bubbles up — NOT tenacity.RetryError
+    assert not isinstance(exc_info.value, tenacity.RetryError)
+    assert "simulated sustained FCM outage" in str(exc_info.value)
+
+    # 3 attempts total per `stop_after_attempt(3)` in app/fcm.py.
+    # Hardcoded here because the @retry decorator's stop= count is awkward
+    # to extract at runtime; if the decorator changes, this test will fail
+    # and force the change to be deliberate.
+    assert call_count["n"] == 3, (
+        f"Expected 3 attempts (stop_after_attempt(3)); got {call_count['n']}"
+    )
+
+
+def test_send_with_retry_does_not_retry_permanent_errors(monkeypatch):
+    """Chunk 5 P2.3 (companion): `_is_transient` returns False for
+    permanent firebase errors (`UnregisteredError`, `InvalidArgumentError`,
+    `SenderIdMismatchError`). Those propagate immediately on the first
+    attempt — no retry budget burned. This pins the predicate's reject
+    list so a future change that accidentally widens transient to
+    everything fails loudly here."""
+
+    from app import fcm as fcm_module
+
+    # Synthetic exception whose class name does NOT match transient_names.
+    class UnregisteredError(Exception):
+        pass
+
+    call_count = {"n": 0}
+
+    def _permanent_failure(message, app=None):
+        call_count["n"] += 1
+        raise UnregisteredError("topic has no subscribers")
+
+    monkeypatch.setattr(fcm_module.messaging, "send", _permanent_failure)
+
+    import pytest
+
+    with pytest.raises(UnregisteredError):
+        fcm_module._send_with_retry(object(), object())
+
+    # Exactly one call — the predicate rejects the retry condition,
+    # tenacity propagates immediately.
+    assert call_count["n"] == 1, (
+        f"Permanent errors must not retry; got {call_count['n']} attempts"
+    )
