@@ -8,18 +8,13 @@ restartPolicyMaxRetries = 10
 healthcheckPath = "/v1/health"
 healthcheckTimeout = 30
 
-# Step 10: Railway native cron. Each [[cron]] block spawns a fresh container
-# that runs the `command` and exits. They share the deploy's image + env vars,
-# so SessionLocal / Firebase creds / ADMIN_TOKEN all work without extra setup.
+# Cron services live in dedicated Railway services with their own config files:
+#   - push-cron service uses /railway.push-cron.toml
+#   - generation-cron service uses /railway.generation-cron.toml
+# This file controls only the API service. See Backend Architecture for the pattern.
 #
-# Schedules are UTC (D15). Generation runs every 6 hours (00:00, 06:00, 12:00,
-# 18:00) so the review queue stays topped up even if Will reviews in batches.
-# Push fires once daily at 00:00 UTC — the canonical "new day" boundary that
-# matches /today's date keying.
-[[cron]]
-schedule = "0 */6 * * *"
-command = "python -m app.cron run_generation"
-
-[[cron]]
-schedule = "0 0 * * *"
-command = "python -m app.cron run_push"
+# Push Forensics 2 (2026-04-30) confirmed that [[cron]] blocks in this file with
+# per-cron `command` fields are not honored by Railway — only the service's
+# dashboard Cron Schedule + Custom Start Command (or its config-as-code equivalent)
+# fire on the schedule. The decorative blocks have been stripped to remove the
+# footgun.

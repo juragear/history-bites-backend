@@ -1,0 +1,20 @@
+# Railway Config-as-Code for the push cron service.
+#
+# This file controls ONLY the push-cron service. The API service uses /railway.toml;
+# the generation cron service uses /railway.generation-cron.toml (created in Session C).
+# See Backend Architecture for the full per-service-config pattern.
+#
+# Why this file exists: Railway's [deploy] startCommand in /railway.toml is service-
+# scoped to whichever service points at that file. Without this dedicated file, the
+# push cron service would inherit /railway.toml's startCommand (uvicorn) instead of
+# python -m app.cron run_push. See Push Forensics 2 for the full diagnostic.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python -m app.cron run_push"
+restartPolicyType = "NEVER"
+# No healthcheckPath: cron containers don't bind a port; healthcheck would always fail.
+# No [[cron]] blocks: Railway doesn't honor per-cron command fields. The cron schedule
+# ("0 0 * * *") lives on the service's dashboard, not in this file.
