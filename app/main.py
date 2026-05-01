@@ -8,19 +8,24 @@ from typing import Annotated
 
 from fastapi import (
     APIRouter,
+    Cookie,
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Query,
     Response,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import wikipedia
 from app.admin import (
+    _is_valid_token,
     admin_unauth_router,
     router as admin_router,
 )
@@ -157,7 +162,94 @@ async def lifespan(app: FastAPI):
     logger.info("lifespan: shutdown — wikipedia client closed")
 
 
-app = FastAPI(title="HistoryBites backend", lifespan=lifespan)
+# Cleanup-A item 2 (Codex P2): admin-gate /docs, /redoc, /openapi.json when
+# ENVIRONMENT=production. Construction always suppresses the FastAPI defaults
+# so the gating logic below is the single source of truth; in dev/test the
+# gate dependency is a no-op (returns immediately) so the routes behave like
+# unrestricted FastAPI defaults.
+app = FastAPI(
+    title="HistoryBites backend",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+
+async def _gate_openapi_in_prod(
+    authorization: Annotated[str | None, Header()] = None,
+    cookie_token: Annotated[
+        str | None, Cookie(alias=settings.ADMIN_COOKIE_NAME)
+    ] = None,
+) -> None:
+    """Cleanup-A item 2: gate /docs, /redoc, /openapi.json in production.
+
+    Dev / test (`ENVIRONMENT != "production"`): no-op. Routes behave like
+    FastAPI defaults — anyone can hit them, useful for local exploration.
+
+    Production (`ENVIRONMENT == "production"`): require admin auth via
+    `Authorization: Bearer <token>` header or the admin session cookie.
+    Form auth doesn't apply here (no form posts on docs). Cookie path
+    is `/admin` so browser-cookie auth doesn't reach `/docs` from a normal
+    session — operators use `curl -H "Authorization: Bearer $ADMIN_TOKEN"`
+    or accept that the browser docs experience requires the bearer header.
+    Tightening cookie scope to `/` is a separate refactor (would broaden
+    cookie exposure to public routes; deferred until there's a need).
+    """
+    if settings.ENVIRONMENT != "production":
+        return
+    candidate: str | None = None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            candidate = value
+    if candidate is None and cookie_token:
+        candidate = cookie_token
+    if candidate is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing admin token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not _is_valid_token(candidate):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid admin token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.get(
+    "/openapi.json",
+    include_in_schema=False,
+    dependencies=[Depends(_gate_openapi_in_prod)],
+)
+async def gated_openapi() -> JSONResponse:
+    return JSONResponse(app.openapi())
+
+
+@app.get(
+    "/docs",
+    include_in_schema=False,
+    dependencies=[Depends(_gate_openapi_in_prod)],
+)
+async def gated_swagger_ui() -> Response:
+    return get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title=f"{app.title} - Swagger UI",
+    )
+
+
+@app.get(
+    "/redoc",
+    include_in_schema=False,
+    dependencies=[Depends(_gate_openapi_in_prod)],
+)
+async def gated_redoc() -> Response:
+    return get_redoc_html(
+        openapi_url="/openapi.json",
+        title=f"{app.title} - ReDoc",
+    )
 
 # Step 12: CORS for any future browser-based admin/dashboard. Bearer-token
 # auth in headers doesn't need cookies, so allow_credentials stays False —
