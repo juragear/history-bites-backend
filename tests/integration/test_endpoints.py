@@ -376,6 +376,35 @@ def test_admin_cron_status_requires_auth(client):
     assert resp.status_code == 401
 
 
+def test_admin_cron_status_latest_scheduled_excludes_retracted(
+    client, admin_token, db
+):
+    """Cleanup-A item 4 (Loose-Ends Medium): latest_scheduled_date must
+    skip retracted facts. Without the is_retracted=False filter, a
+    retracted future fact is reported as the latest scheduled day, which
+    is operationally misleading (id=22 / 2026-05-11 ghost in production
+    pre-fix). With the filter, latest_scheduled_date returns the most
+    recent NON-retracted scheduled_date."""
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    far_future = today + timedelta(days=10)
+
+    # Real scheduled fact yesterday.
+    _scheduled(db, scheduled_date=yesterday, external_id="e-y")
+    # Retracted fact far in the future — must NOT count as "latest".
+    _scheduled(
+        db, scheduled_date=far_future, external_id="e-retracted", is_retracted=True
+    )
+    # Real scheduled fact today.
+    _scheduled(db, scheduled_date=today, external_id="e-today")
+
+    resp = client.get("/admin/cron/status", headers=_bearer(admin_token))
+    assert resp.status_code == 200
+    body = resp.json()
+    # Latest non-retracted scheduled day is `today`, NOT `far_future`.
+    assert body["latest_scheduled_date"] == today.isoformat()
+
+
 def test_admin_cron_status_503_when_db_unreachable(
     client, admin_token, monkeypatch
 ):

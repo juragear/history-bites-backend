@@ -3,6 +3,12 @@ name = "historybites-backend"
 version = "0.1.0"
 description = "HistoryBites backend — daily history fact delivery API."
 requires-python = ">=3.12"
+# Cleanup-A item 3 (Codex P2): runtime deps stay unconstrained here — the
+# canonical pinned versions live in uv.lock, with requirements.txt
+# auto-generated from the lock for Nixpacks/pip consumption in production.
+# To regenerate after a dep change:
+#   uv lock
+#   uv export --frozen --no-dev --no-emit-project --format requirements.txt -o requirements.txt
 dependencies = [
     "fastapi",
     "uvicorn[standard]",

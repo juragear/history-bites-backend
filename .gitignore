@@ -19,3 +19,6 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code agent state (per-session settings, plans, scratch)
+.claude/
