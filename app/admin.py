@@ -943,8 +943,16 @@ def admin_cron_status(response: Response) -> CronStatusResponse:
                 .select_from(PoolFact)
                 .where(PoolFact.status == "approved")
             ).scalar_one()
+            # Cleanup-A item 4 (Loose-Ends Medium): exclude retracted facts.
+            # Without this filter, a retracted fact at the tail of the schedule
+            # (e.g. id=22 on 2026-05-11 in the post-launch state) keeps
+            # appearing as `latest_scheduled_date` even though it's not a real
+            # scheduled day from the operator's perspective. Mirrors the
+            # is_retracted filtering used by /v1/today and /v1/archive.
             latest = db.execute(
-                select(func.max(Fact.scheduled_date))
+                select(func.max(Fact.scheduled_date)).where(
+                    Fact.is_retracted.is_(False)
+                )
             ).scalar_one()
             # Step 9 carryover: most-recent-wins MAX(pushed_at).
             last_push_at = db.execute(
