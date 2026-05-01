@@ -25,6 +25,7 @@ from app.admin import (
     router as admin_router,
 )
 from app.config import settings
+from app.security_headers import SecurityHeadersMiddleware
 from app.db import SessionLocal, get_db
 from app.models import Fact
 from app.schemas import (
@@ -171,6 +172,10 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Cleanup-A item 1 (Codex P2): security headers on every response. See
+# app/security_headers.py for header rationale + CSP notes.
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.include_router(admin_router)
 # Code Review Fix 6 (2026-04-29; replaces Fix 1's `admin_review_page_router`):
