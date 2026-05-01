@@ -396,3 +396,54 @@ None of that is built. For v1, retract is best-effort cleanup of a mistake going
 - Soft-deleting the v1 row on v2 generation (loses the calibration baseline; defeats the entire point of the A/B).
 - A separate `pool_v2` table (architectural duplication; every consumer — admin endpoints, scheduler, /health counts — would need to learn about both tables).
 
+---
+
+## D28 — Code Review Pre-Phase-2 architectural outcomes
+
+**Decision:** Six concrete architectural changes from the Code Review Pre-Phase-2 chain (Fix 1 → Fix 6 + Cron Architecture Fix A→E). Bundled because they're outcomes of one coordinated review process; separate decisions would fragment the rationale.
+
+### D28a: Cookie-based admin handoff (Fix 6, reverses Fix 1's deferral)
+
+The admin browser flow uses an HttpOnly + Secure + SameSite=Strict session cookie set by `POST /admin/login`, replacing Fix 1's `?token=...` query-string approach. Cookie is `Path=/admin`-scoped with a 30-day default lifetime. Bearer-header auth (curl, Phase 2 mobile) is unchanged.
+
+**Why:** Tokens in URLs leak (browser history, server logs, referrer headers). The cookie path keeps the same UX (paste token once, browse review queue) without the leakage. SameSite=Strict + Path=/admin + HttpOnly contain the cookie tightly. Reverses Fix 1's "defer cookie auth" call from earlier in the review chain — Fix 1 deemed cookies overkill for solo-operator review; production exposure (token in copy-pasted URL → browser history persistence + screenshot risk) made the cost/benefit flip.
+
+### D28b: Auth-channel collapse from three to two (header + cookie)
+
+Pre-Fix-1 admin auth accepted three sources: `Authorization: Bearer`, `?token=...` query string, and a hidden form field. Fix 1 narrowed to two-with-strict-routing. Fix 6 collapsed back to a single unified `verify_admin_token` dependency that accepts header OR cookie OR form, with the query path eliminated entirely.
+
+**Why:** Fewer code paths means a single 401 surface for OpenAPI consistency and removes the URL-leakage attack vector. Form path stays for the `/admin/login` bootstrap. Single dep applied at router level (`dependencies=[Depends(verify_admin_token)]`) inherits to every nested route.
+
+### D28c: `ErrorDetail` canonical error envelope (Fix 4 P2.2)
+
+All admin endpoints declare a 401 response with `model=ErrorDetail` for OpenAPI consistency (`responses={401: {"model": ErrorDetail}}` at router level). ErrorDetail is the standard `{detail: str}` shape FastAPI uses by default; declaring it explicitly stops the OpenAPI spec from emitting each route's 401 with a different ad-hoc body.
+
+**Why:** Phase 2 Flutter clients generated from OpenAPI need a single error type, not N variants. Single declaration at router level propagates correctly through Cleanup-A's admin-gated `/openapi.json` once Fix 6's cookie path is live.
+
+### D28d: JSONFormatter traceback rendering (Fix 3 P2.1)
+
+The custom JSONFormatter at `app/main.py` renders `record.exc_info` into `exc_type`, `exc_message`, and `traceback` fields when present. Without this, `logger.exception(...)` calls silently dropped tracebacks despite the call site explicitly asking for them.
+
+**Why:** `admin.py` admin_run_generation broad-except (line 725) and `cron.py` CLI catch-all (line 344) both relied on `logger.exception` for production diagnostics — pre-fix neither produced a stack trace in Railway logs. Catch-all except blocks without tracebacks are invisible failures; the cost was log-noise diagnosis vs zero diagnosis. Clearly worth it.
+
+### D28e: FastAPI lifespan migration (Fix 4 P3.3)
+
+Migrated from FastAPI's deprecated `@app.on_event("startup")` / `@app.on_event("shutdown")` to the modern `lifespan=` async context manager. Wikipedia `httpx.AsyncClient` opens pre-yield and closes post-yield via `await wikipedia.aclose()`.
+
+**Why:** `on_event` has been deprecated since FastAPI 0.93 (2023). Lifespan handlers also let us share state via context and don't depend on event timing — cleaner semantics, future-proof for FastAPI's eventual removal of the legacy hooks. Note: cron CLI path doesn't go through lifespan (Session A.2 observation), but Session C.10 verified Wikipedia client exit is observed-clean within ~15–20s of last DB write (well under Railway's 30s container-teardown budget). Belt-and-braces explicit close in the cron CLI is a deferred nice-to-have.
+
+### D28f: Per-service Config-as-Code paths (Cron Architecture Fix chain)
+
+Each Railway service points at its own `railway.*.toml`: API → `/railway.toml`, push-cron → `/railway.push-cron.toml`, gen-cron → `/railway.generation-cron.toml`. Per-service files only specify fields that differ from `/railway.toml`; the rest fall back to defaults (Backend Architecture cron footnote 4).
+
+**Why:** Railway's `[deploy] startCommand` from `/railway.toml` overrides any dashboard-set Custom Start Command (Push Forensics 2 diagnostic — Hypothesis B confirmed). Without per-service config, every service bound to the repo runs the API's start command (uvicorn) instead of its own (`python -m app.cron run_push` etc.). Per-service config files give each service its own `startCommand` while sharing the base build config. The decorative `[[cron]]` blocks that previously sat in `/railway.toml` are stripped — Railway doesn't honor per-cron `command` fields; the schedule lives on each service's dashboard.
+
+**Implication:** Every push to main auto-fans-out to all 3 services bound to that branch (Backend Architecture cron footnote 1). For scope-to-one-service deploys, use `railway up -s <svc>` from a non-default branch.
+
+**Why bundled:** All six are outcomes of the Code Review Pre-Phase-2 chain (Fix 1 → Fix 6 + Cron Architecture Fix A→E). Architecturally they touch different layers (auth UX, error envelope, observability, lifecycle, deploy topology), but they shipped as one coordinated hardening pass with a single deploy lifecycle. Separate D28–D33 entries would fragment rationale that's better understood as a unit — the narrative arc (Code Review surfaces issues → Fixes 1–6 → cron architecture forensics → per-service config) is the load-bearing context.
+
+**Rejected:**
+- Separate D28–D33 entries (one per item) — fragments rationale; loses the chain's narrative arc
+- Folding Cleanup-A's Codex P2 hardening (security headers, OpenAPI gating, deps pinning) into D28 — those came from Codex's independent audit, not the Pre-Phase-2 chain. A future D29+ may capture Codex outcomes if any rise to architectural-decision level
+- Verbatim from PR descriptions — too narrow; D28 captures the *why* once for posterity, not the per-commit changelog
+
