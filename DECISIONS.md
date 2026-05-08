@@ -447,3 +447,24 @@ Each Railway service points at its own `railway.*.toml`: API → `/railway.toml`
 - Folding Cleanup-A's Codex P2 hardening (security headers, OpenAPI gating, deps pinning) into D28 — those came from Codex's independent audit, not the Pre-Phase-2 chain. A future D29+ may capture Codex outcomes if any rise to architectural-decision level
 - Verbatim from PR descriptions — too narrow; D28 captures the *why* once for posterity, not the per-commit changelog
 
+
+
+## D29 — Phase 1 backend cutover from Railway to GCP completed 2026-05-08
+
+**Decision:** Phase 1 backend production traffic moved from Railway to GCP Cloud Run on 2026-05-08T15:34:19Z. Railway is retained in stopped state through the 48h monitoring window; services deleted at G3.6 with Postgres held an additional 7 days for rollback.
+
+**Why:** Railway provided fast iteration during Phase 1 build but couldn't support the launch-readiness posture needed before mobile dev (Phase 2) starts. Specifically: Secret Manager runtime injection (vs Railway's build-time ARG/ENV bake), private-IP Postgres (vs Railway's public-IP), per-workload IAM (vs single env-var pile), Cloud Logging that captures short-lived cron containers reliably, and audit logging for any future compliance posture. Three deferred items closed permanently as side effects: build-time secret leak (closed via runtime-only Secret Manager injection in the new Dockerfile), native uv-sync in build (Cloud Build's pipeline uses `uv sync --frozen` natively), `PYTHONUNBUFFERED=1` baked into the image.
+
+**Architecture:** Cloud Run service `historybites-api` + Cloud Run jobs `push-cron`/`gen-cron` invoked by Cloud Scheduler via OIDC. Cloud SQL Postgres 16 (private IP, ENTERPRISE zonal, db-f1-micro, PITR enabled). Secret Manager for all 5 runtime secrets. Per-workload service accounts with scoped IAM. Direct VPC egress for DB connectivity (NOT Cloud SQL Auth Proxy — see vault lesson `gcp-cloud-sql-private-ip-direct-vpc.md` for reasoning). Cloud Build trigger on `main` push auto-deploys; backend GitHub Actions CI gates PRs.
+
+**Migration arc:**
+- G1 (2026-05-07): Foundation — APIs, service accounts, Artifact Registry, Cloud SQL provisioning, Secret Manager, hand-rolled multi-stage Dockerfile, first Cloud Run deploy with empty DB.
+- G2 (2026-05-08): Functional completeness — push-cron + gen-cron Cloud Run jobs, Cloud Scheduler, backend GitHub Actions CI, Cloud Build trigger, Cloud Monitoring + email alerting (verified by throwaway-job test), backup restore drill (verified end-to-end with canonical recovery runbook in vault Maintenance Playbook).
+- G3 (2026-05-08): Cutover — pool curated to 8 approved v4.1 facts, pre-cutover Cloud SQL backup `1778254115928`, Railway GitHub auto-deploy disconnected, vault + repo docs updated, 48h monitoring window covering May 9 (expected skip due to retracted slot from v3 pool flush) + May 10 (first real push of v4.1 fact), then Railway service deletion.
+
+**Rejected:**
+- Railway data migration (pg_dump → restore) — fresh-start data with organic re-curation was simpler; Railway data was thin (Phase 1 prototype curation only) and v3-prompt anyway.
+- Cloud SQL Auth Proxy sidecar — works for public-IP only; private-IP Cloud SQL needs Direct VPC egress regardless, which makes the proxy redundant. See vault lesson.
+- Domain mapping at G3 — deferred to launch prep; Cloud Run URL is sufficient until mobile launch.
+- Migrating to GCP-native managed Postgres alternatives (AlloyDB, Spanner) — Cloud SQL is fine at our scale; AlloyDB starts at ~$200/mo, Spanner is overkill.
+- Keeping Railway as warm-standby — operational tax of keeping two backends synchronized exceeds the rollback insurance value once the monitoring window passes clean.

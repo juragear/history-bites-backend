@@ -1,7 +1,13 @@
 # HistoryBites Backend
 
 One-fact-a-day history app backend. FastAPI + Postgres + Firebase Cloud
-Messaging, deployed on Railway with native cron.
+Messaging, deployed on **GCP Cloud Run** with Cloud Scheduler-driven cron jobs.
+
+> **Deployment platform changed 2026-05-08** (G-arc Railway → GCP cutover; see
+> `DECISIONS.md` D29). Railway sections lower in this README are historical
+> and will be cleaned up in a follow-up. Production URL is now
+> `https://historybites-api-mnfe6wnwrq-uc.a.run.app` (Cloud Run); the
+> Railway URL is being sunset post-monitoring-window.
 
 The pipeline picks a Wikipedia article from a curated `(category, region, era)`
 seed list, asks Gemini to extract one surprising fact in its own words, parks
