@@ -1,0 +1,46 @@
+# Cloud Build pipeline: build amd64 image + deploy to Cloud Run on main push.
+# Triggered by Cloud Build trigger `backend-main-deploy` (created via gcloud
+# in G2.8 of the Railway → GCP migration arc).
+#
+# Substitutions auto-supplied by Cloud Build:
+#   $PROJECT_ID  — project ID (history-app-495607)
+#   $SHORT_SHA   — short git SHA of the trigger commit
+#   $COMMIT_SHA  — full git SHA
+
+steps:
+  # Build the image (amd64 only — Cloud Run requires amd64/linux)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-image
+    args:
+      - 'buildx'
+      - 'build'
+      - '--platform=linux/amd64'
+      - '--push'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/historybites/api:$SHORT_SHA'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/historybites/api:latest'
+      - '.'
+
+  # Deploy the new image to the existing Cloud Run service
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy-cloudrun
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'historybites-api'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/historybites/api:$SHORT_SHA'
+      - '--region=us-central1'
+      - '--quiet'
+    waitFor: ['build-image']
+
+# Cloud Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # Faster builds; minor cost increase
+
+# Tag the build with the commit SHA for later traceability
+tags:
+  - 'backend'
+  - 'main-deploy'
