@@ -1,0 +1,42 @@
+# VCS
+.git
+.gitignore
+
+# Python venvs and caches
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests (not needed in runtime image)
+tests
+
+# Local secrets and env
+.env
+.env.local
+.env.*.local
+
+# OS / editor
+.DS_Store
+.idea
+.vscode
+
+# Misc local artifacts
+HistoryNotificationApp
+*.log
+build
+dist
+*.egg-info
+
+# Docs / dev-only
+README.md
+DECISIONS.md
+docs
+
+# Don't need uv cache or pip cache in image
+.uv-cache
+.pip-cache
