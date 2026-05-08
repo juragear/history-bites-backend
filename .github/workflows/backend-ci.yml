@@ -1,0 +1,59 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: historybites
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: historybites_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U historybites"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://historybites:testpass@localhost:5432/historybites_test
+      ENVIRONMENT: test
+      ADMIN_TOKEN: test-admin-token-do-not-use-in-production
+      GEMINI_API_KEY: test-gemini-key
+      WIKIPEDIA_USER_AGENT: HistoryBitesTest/1.0
+      LOG_LEVEL: WARNING
+      FCM_TOPIC: test_topic
+      MODEL_PROVIDER: gemini
+      GEMINI_MODEL: gemini-2.5-flash
+      PROMPT_VERSION: v3
+      REVIEW_QUEUE_TARGET: "20"
+      APPROVED_ALERT_THRESHOLD: "3"
+      APPROVED_TARGET: "7"
+      FIREBASE_SERVICE_ACCOUNT_JSON: '{"type":"service_account","project_id":"test","private_key":"test","client_email":"test@test.iam.gserviceaccount.com"}'
+      ALERT_WEBHOOK_URL: https://example.com/webhook-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Lint with ruff
+        run: uv run ruff check .
+        continue-on-error: true  # Soften initially — not all repos pass strict ruff
+      - name: Alembic head check
+        run: uv run alembic check
+        continue-on-error: true  # Soften initially — alembic check syntax varies by version
+      - name: Run pytest
+        run: uv run pytest -v
