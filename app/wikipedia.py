@@ -331,6 +331,8 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("Category:Han_dynasty",                          "East Asia",          "ancient"),
     ("Category:Tang_dynasty",                         "East Asia",          "medieval"),
     ("Category:Heian_period",                         "East Asia",          "medieval"),
+    # 2026-05-14 add: named-individual-rich (Minamoto no Yoshinaka, etc.)
+    ("Category:Shōguns",                              "East Asia",          "medieval"),
     ("Category:Ming_dynasty",                         "East Asia",          "early-modern"),
     ("Category:Sengoku_period",                       "East Asia",          "early-modern"),
     ("Category:Meiji_era",                            "East Asia",          "modern"),
@@ -346,6 +348,8 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("Category:Ottoman_Empire",                       "Middle East",        "early-modern"),
     # North Africa
     ("Category:Ancient_Egypt",                        "North Africa",       "ancient"),
+    # 2026-05-14 add: pharaohs are named individuals (Tutankhamun, Cleopatra, etc.)
+    ("Category:Pharaohs",                             "North Africa",       "ancient"),
     ("Category:Carthage",                             "North Africa",       "ancient"),
     ("Category:Ptolemaic_Kingdom",                    "North Africa",       "classical"),
     # Sub-Saharan Africa
@@ -356,10 +360,22 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("Category:Ancient_Greece",                       "Mediterranean",      "ancient"),
     ("Category:Roman_Republic",                       "Mediterranean",      "ancient"),
     ("Category:Roman_Empire",                         "Mediterranean",      "classical"),
+    # 2026-05-14 add: named-individual-rich (Augustus, Trajan, Marcus Aurelius, etc.)
+    ("Category:Roman_emperors",                       "Mediterranean",      "classical"),
     ("Category:Crusades",                             "Mediterranean",      "medieval"),
+    # 2026-05-14 add: 200+ named individual popes across the medieval era
+    ("Category:Popes",                                "Mediterranean",      "medieval"),
     ("Category:Renaissance",                          "Mediterranean",      "early-modern"),
+    # 2026-05-14 add: named-individual-rich (Erasmus, More, Petrarch, Pico della Mirandola, ...)
+    ("Category:Renaissance_humanists",                "Mediterranean",      "early-modern"),
+    # 2026-05-14 add: 200+ named individual painters (Botticelli, da Vinci, Michelangelo, ...)
+    ("Category:Italian_Renaissance_painters",         "Mediterranean",      "early-modern"),
     # Northern Europe
+    # 2026-05-14 add: named-individual-rich (Charlemagne, Pepin the Short, Louis the Pious, ...)
+    ("Category:Carolingian_dynasty",                  "Northern Europe",    "medieval"),
     ("Category:Hanseatic_League",                     "Northern Europe",    "medieval"),
+    # 2026-05-14 add: Tudor monarchs + named courtiers (Henry VIII, Elizabeth I, Cromwell, ...)
+    ("Category:Tudor_England",                        "Northern Europe",    "early-modern"),
     ("Category:Tsardom_of_Russia",                    "Northern Europe",    "early-modern"),
     # Mesoamerica / South America (pre-Columbian)
     ("Category:Mesoamerican_cultures",                "Mesoamerica",        "pre-Columbian"),
@@ -367,7 +383,11 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("Category:Inca_Empire",                          "South America",      "pre-Columbian"),
     # Americas (colonial / modern)
     ("Category:Spanish_colonization_of_the_Americas", "Mesoamerica",        "early-modern"),
+    # 2026-05-14 add: named-individual-rich (Cortés, Pizarro, de Soto, Coronado, ...)
+    ("Category:Conquistadors",                        "Mesoamerica",        "early-modern"),
     ("Category:Colonial_United_States_(British)",     "North America",      "early-modern"),
+    # 2026-05-14 add: 144 named individuals (Washington, Jefferson, Franklin, Hamilton, ...)
+    ("Category:Founding_Fathers_of_the_United_States", "North America",     "modern"),
     ("Category:American_Civil_War",                   "North America",      "modern"),
     # Oceania
     ("Category:Polynesian_navigation",                "Oceania",            "medieval"),
